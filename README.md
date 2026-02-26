@@ -1,4 +1,5 @@
 # ESP32-S3 E-Ink Photo Frame
+[![Watch the video](https://img.youtube.com/vi/A8poN4a6Aiw/0.jpg)](https://www.youtube.com/watch?v=A8poN4a6Aiw)
 
 Custom firmware for the [Waveshare ESP32-S3-PhotoPainter](https://www.waveshare.com/wiki/ESP32-S3-PhotoPainter), a battery-powered e-ink photo frame featuring an ESP32-S3 and a 7.3" Spectra ACeP 6-colour display (800×480). This project replaces the stock firmware with an Arduino-based sketch that fetches random images from an nginx server over WiFi, resizes and Floyd–Steinberg dithers them to the 6-colour palette, and displays them on the panel. It also reports temperature, humidity, and battery voltage to Home Assistant via MQTT.
 
