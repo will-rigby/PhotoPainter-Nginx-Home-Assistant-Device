@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: 0BSD
+
 // --------------------------------------------------
 // SHTC3 Temperature & Humidity → MQTT (Home Assistant)
 // --------------------------------------------------

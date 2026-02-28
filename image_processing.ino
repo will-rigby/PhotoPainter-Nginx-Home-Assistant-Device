@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: 0BSD
+
 // --------------------------------------------------
 // Image Processing: JPEG/BMP decode → resize → dither
 // --------------------------------------------------

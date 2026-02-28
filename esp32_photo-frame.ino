@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: 0BSD
+
 #include <SPI.h>
 #include <Wire.h>
 #include <WiFi.h>

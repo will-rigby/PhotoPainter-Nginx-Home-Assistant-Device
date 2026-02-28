@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: 0BSD
+
 // --------------------------------------------------
 // Spectra 7.3" ACeP E-Paper Driver
 // (EPD constants defined in esp32_photo-frame.ino)

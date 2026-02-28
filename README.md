@@ -1,5 +1,7 @@
 # ESP32-S3 E-Ink Photo Frame
+
 [![Watch the video](https://img.youtube.com/vi/A8poN4a6Aiw/0.jpg)](https://www.youtube.com/watch?v=A8poN4a6Aiw)
+_YouTube Overview_
 
 Custom firmware for the [Waveshare ESP32-S3-PhotoPainter](https://www.waveshare.com/wiki/ESP32-S3-PhotoPainter), a battery-powered e-ink photo frame featuring an ESP32-S3 and a 7.3" Spectra ACeP 6-colour display (800×480). This project replaces the stock firmware with an Arduino-based sketch that fetches random images from an nginx server over WiFi, resizes and Floyd–Steinberg dithers them to the 6-colour palette, and displays them on the panel. It also reports temperature, humidity, and battery voltage to Home Assistant via MQTT.
 
@@ -223,3 +225,11 @@ This project uses the following third-party libraries. Full license texts are av
 | [PubSubClient](https://github.com/knolleary/pubsubclient) | Nick O'Leary | MIT | [knolleary/pubsubclient](https://github.com/knolleary/pubsubclient) |
 
 The WiFi, HTTPClient, SD, SPI, and Wire libraries are part of the [ESP32 Arduino Core](https://github.com/espressif/arduino-esp32) by Espressif Systems, licensed under the **GNU Lesser General Public License v2.1 (LGPL-2.1)**.
+
+## License
+
+This project is licensed under the **BSD Zero Clause License (0BSD)**. See [LICENSE](LICENSE).
+
+In short: you can use, modify, and redistribute this project for any purpose, including commercial use, without attribution. The software is provided "as is" without warranty.
+
+Third-party libraries remain under their own licenses (MIT, Apache-2.0, LGPL-2.1). If you distribute binaries/firmware, keep the relevant third-party notices and provide source/build information as required by those licenses.
