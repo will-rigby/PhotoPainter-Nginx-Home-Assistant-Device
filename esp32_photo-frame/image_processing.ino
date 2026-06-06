@@ -411,35 +411,14 @@ static void floydSteinbergDither(uint8_t* rgb, int w, int h) {
 }
 
 // --------------------------------------------------
-// Main pipeline: decode → resize → dither
-// --------------------------------------------------
-
-// --------------------------------------------------
-// Map a stored EPD colour code (0x0..0x6) back to RGB.
-// Used to render gallery previews from the packed 4bpp .bin buffers.
-// --------------------------------------------------
-
-void epdCodeToRGB(uint8_t code, uint8_t& r, uint8_t& g, uint8_t& b) {
-  switch (code) {
-    case EPD_BLACK:  r = 0;   g = 0;   b = 0;   break;
-    case EPD_WHITE:  r = 255; g = 255; b = 255; break;
-    case EPD_YELLOW: r = 255; g = 236; b = 0;   break;
-    case EPD_RED:    r = 200; g = 30;  b = 30;  break;
-    case EPD_BLUE:   r = 30;  g = 30;  b = 200; break;
-    case EPD_GREEN:  r = 60;  g = 150; b = 60;  break;
-    default:         r = 255; g = 255; b = 255; break;
-  }
-}
-
-// --------------------------------------------------
-// Upload pipeline: decode/resize/dither a source image into the EPD
+// Processing pipeline entry: decode/resize/dither a source image into the EPD
 // framebuffer, then persist the framebuffer as a .bin on the SD card.
-// Runs on USB power (web upload) so the heavy work happens off-battery.
+// Called by the background queue (USB power) so the heavy work is off-battery.
 // --------------------------------------------------
 
-bool processUploadToBin(const char* tmpPath, const char* outBinPath) {
-  if (!processImage(tmpPath)) {
-    Serial.println("Upload processing failed (decode/resize/dither)");
+bool processUploadToBin(const char* srcPath, const char* outBinPath) {
+  if (!processImage(srcPath)) {
+    Serial.println("Processing failed (decode/resize/dither)");
     return false;
   }
   if (!epdSaveBufferToFile(outBinPath)) {

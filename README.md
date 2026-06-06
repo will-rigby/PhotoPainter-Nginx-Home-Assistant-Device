@@ -5,7 +5,7 @@ _YouTube Overview (covers the earlier nginx-based version)_
 
 Custom firmware for the [Waveshare ESP32-S3-PhotoPainter](https://www.waveshare.com/wiki/ESP32-S3-PhotoPainter), a battery-powered e-ink photo frame featuring an ESP32-S3 and a 7.3" Spectra ACeP 6-colour display (800×480). This project replaces the stock firmware with an Arduino-based sketch.
 
-The frame is **self-contained**: when plugged into USB-C power it runs a built-in **web server** where you browse a **gallery** of the photos already on the SD card and **upload** new ones from your phone or computer. Uploaded images are resized and Floyd–Steinberg dithered to the 6-colour palette **on upload** and stored on the SD card in the panel's native format. On battery the frame deep-sleeps, rotating through the stored photos and reporting temperature, humidity, and battery voltage to Home Assistant via MQTT. **No external image server is required.**
+The frame is **self-contained**: when plugged into USB-C power it runs a built-in **web server** where you browse a **gallery** of your original photos on the SD card and **upload** new ones (one or many at a time) from your phone or computer. The originals are kept on the card, and each is resized and Floyd–Steinberg dithered to the 6-colour panel format **in the background**. On battery the frame deep-sleeps, rotating through the dithered photos and reporting temperature, humidity, and battery voltage to Home Assistant via MQTT. **No external image server is required.**
 
 > **Note:** This firmware is **not** based on the official Waveshare ESP-IDF demo. It is written from scratch using the Arduino framework. The stock firmware is not required, but an SD card **is** (it stores your photos).
 
@@ -22,8 +22,8 @@ By default (no saved network) the frame **hosts its own WPA2 access point** name
 
 ## Features
 
-- Built-in web server (USB-powered): photo **gallery**, **upload**, **delete**, and "show now"
-- Photos pre-processed on upload (bilinear cover-crop to 800×480 + Floyd–Steinberg dither to the 6-colour ACeP palette) and stored on the SD card as ready-to-display panel buffers
+- Built-in web server (USB-powered): photo **gallery** (shows originals), multi-file **upload**, **delete**, and "show now"
+- Originals kept on the SD card; each dithered to the 800×480 6-colour panel format (bilinear cover-crop + Floyd–Steinberg) in a **background queue** so uploads don't block
 - Self-hosting WPA2 access point with web-based WiFi configuration; STA with AP fallback
 - Web-based MQTT configuration (separate settings page)
 - Settings persisted to flash (NVS) — no recompiling to change WiFi/MQTT
@@ -89,10 +89,10 @@ If you'd like a device to come up already knowing your WiFi/MQTT (so you can ski
 
 ### 5. Using the gallery
 
-- **Upload** — on the Gallery page, choose a `.jpg`, `.jpeg`, or `.bmp` and upload it. The frame decodes, crops to 800×480, dithers, and stores it. Processing takes a few seconds.
-- **Show** — display any stored photo on the panel immediately (~30s refresh).
-- **Delete** — remove a photo from the SD card.
-- Thumbnails and previews are rendered on the fly from the stored panel buffers.
+- **Upload** — on the Gallery page, choose one or more `.jpg`/`.jpeg`/`.bmp` files (multi-select is supported) and upload. The originals are saved immediately and each is dithered to the panel format in the background; cards show *processing* until *ready*.
+- **Gallery** — shows the original photos. Each shows a status badge (*processing* / *ready* / *failed*).
+- **Show** — display a *ready* photo on the panel immediately (~30s refresh).
+- **Delete** — removes both the original and its dithered buffer from the SD card.
 
 ### 6. MQTT / Home Assistant
 
@@ -129,11 +129,11 @@ No manual MQTT entity configuration is needed — just ensure the HA MQTT integr
 
 | File                    | Description                                                        |
 |-------------------------|--------------------------------------------------------------------|
-| `esp32_photo-frame.ino` | Main sketch — power-mode selection, setup/loop, display rotation   |
+| `esp32_photo-frame.ino` | Main sketch — power-mode selection, setup/loop, display rotation, background dithering queue |
 | `spectra73.ino`         | Spectra 7.3" ACeP e-ink panel driver + framebuffer ⇄ SD `.bin` I/O |
-| `image_processing.ino`  | JPEG/BMP decode, bilinear resize, Floyd–Steinberg dither, BMP preview |
+| `image_processing.ino`  | JPEG/BMP decode, bilinear resize, Floyd–Steinberg dither           |
 | `network.ino`           | WiFi station connect + WPA2 access-point fallback                  |
-| `webserver.ino`         | HTTP server: gallery, upload, previews, WiFi/MQTT settings pages   |
+| `webserver.ino`         | HTTP server: gallery, upload, serve originals, WiFi/MQTT settings pages |
 | `config.ino` / `config.h` | Persistent configuration (Preferences/NVS)                       |
 | `config_defaults.h`     | Compile-time factory defaults (AP name/password, rotate interval)  |
 | `sdcard.ino`            | SD card initialisation                                             |
@@ -142,16 +142,20 @@ No manual MQTT entity configuration is needed — just ensure the HA MQTT integr
 
 ## Storage layout (SD card)
 
-- `/photos/<name>.bin` — pre-processed panel buffers (192,000 bytes each, 4bpp). This is the gallery and the source for display rotation.
-- `/upload_tmp.*` — temporary file used while an upload is being processed, deleted afterwards.
+- `/originals/<base>.<ext>` — the original uploaded photos (`.jpg`/`.jpeg`/`.bmp`). **This is what the gallery displays.**
+- `/dithered/<base>.bin` — pre-processed 800×480 4bpp panel buffers (192,000 bytes each), paired with each original by base name. **This is the source for display rotation.**
 
-## Image pipeline (on upload)
+A photo shows as *processing* in the gallery until its `/dithered/<base>.bin` exists, then *ready*.
 
-1. The browser uploads a JPEG/BMP to `/upload`; it is streamed to a temp file on the SD card.
-2. `processImage()` in [image_processing.ino](esp32_photo-frame/image_processing.ino) decodes it, selects the most aggressive downscale that still covers 800×480, and bilinear-resizes (cover + centred crop) into an RGB888 buffer in PSRAM.
-3. The Floyd–Steinberg stage converts the RGB data into the 6-colour ACeP palette directly in the panel framebuffer.
-4. The framebuffer is written to `/photos/<name>.bin` (`epdSaveBufferToFile`) and the temp file is deleted.
-5. At display time the frame simply loads a `.bin` back into the framebuffer (`epdLoadBufferFromFile`) and refreshes the panel — no decoding needed, which keeps battery refreshes fast and cheap.
+## Image pipeline (upload → background dithering)
+
+1. The browser uploads one or more JPEG/BMP files to `/upload`; each is streamed straight into `/originals` and the request returns immediately (no blocking).
+2. The frame drains a **background queue** (`processNextPending()` in [esp32_photo-frame.ino](esp32_photo-frame/esp32_photo-frame.ino)), one image at a time between web requests, so the UI stays responsive while a batch processes.
+3. For each pending original, `processImage()` in [image_processing.ino](esp32_photo-frame/image_processing.ino) decodes it, picks the most aggressive downscale that still covers 800×480, and bilinear-resizes (cover + centred crop) into an RGB888 buffer in PSRAM.
+4. The Floyd–Steinberg stage converts the RGB data into the 6-colour ACeP palette directly in the panel framebuffer, which is then written to `/dithered/<base>.bin` (`epdSaveBufferToFile`).
+5. At display time the frame just loads a `.bin` back into the framebuffer (`epdLoadBufferFromFile`) and refreshes the panel — no decoding needed, which keeps battery refreshes fast and cheap.
+
+Deleting a photo removes both its original and its dithered buffer. A file that fails to decode is marked *failed* and skipped (not retried in a loop).
 
 ## Power / mode behaviour
 

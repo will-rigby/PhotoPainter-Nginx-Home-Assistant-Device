@@ -61,12 +61,14 @@
 
 #define SLEEP_DURATION_US   (5ULL * 60ULL * 1000000ULL) // 5 minutes
 #define WAKES_PER_UPDATE    6                            // 6 × 5 min = 30 min
-#define PHOTO_DIR_PATH      "/photos"
 
 // Server-mode (USB powered) timers
 #define SENSOR_INTERVAL_MS  (5UL * 60UL * 1000UL)             // 5 minutes
 #define ROTATE_INTERVAL_MS  ((uint32_t)ROTATE_MINUTES * 60UL * 1000UL)
 #define POWER_CHECK_MS      10000UL                           // re-check USB every 10s
+#define WORK_QUIET_MS       1500UL                            // don't process within this of an upload
+#define WORK_GAP_MS         100UL                             // min gap between processing two images
+#define MAX_FAILED          32                                // session failed-set size
 
 // --------------------------------------------------
 // RTC-persistent state (survives deep sleep)
@@ -90,6 +92,14 @@ PubSubClient  mqtt(mqttWifi);
 static uint32_t lastSensor     = 0;
 static uint32_t lastRotate     = 0;
 static uint32_t lastPowerCheck = 0;
+static uint32_t lastWork       = 0;
+
+// Background dithering queue state (server mode). workPending and lastUploadMs
+// are also set from the web upload handler in webserver.ino.
+bool       workPending  = false;
+uint32_t   lastUploadMs = 0;
+static String failedBases[MAX_FAILED];
+static int    failedCount = 0;
 
 // --------------------------------------------------
 // PMU
@@ -134,9 +144,9 @@ static bool isBinFile(File& e) {
 
 bool displayRandomFromSD() {
   // Pass 1: count the .bin photos.
-  File dir = SD.open(PHOTO_DIR_PATH);
+  File dir = SD.open(DITHERED_DIR);
   if (!dir) {
-    Serial.println("No /photos directory on SD card");
+    Serial.println("No /dithered directory on SD card");
     return false;
   }
   int count = 0;
@@ -155,7 +165,7 @@ bool displayRandomFromSD() {
   int target = esp_random() % count;
 
   // Pass 2: walk to the target-th .bin and resolve its path.
-  dir = SD.open(PHOTO_DIR_PATH);
+  dir = SD.open(DITHERED_DIR);
   String chosen;
   int i = 0;
   while ((e = dir.openNextFile())) {
@@ -164,7 +174,7 @@ bool displayRandomFromSD() {
         String nm = String(e.name());
         int s = nm.lastIndexOf('/');
         if (s >= 0) nm = nm.substring(s + 1);
-        chosen = String(PHOTO_DIR_PATH "/") + nm;
+        chosen = String(DITHERED_DIR "/") + nm;
         e.close();
         break;
       }
@@ -184,6 +194,87 @@ bool displayRandomFromSD() {
 
   epdDisplayCurrentBuffer();
   return true;
+}
+
+// --------------------------------------------------
+// Background dithering queue (server mode)
+// --------------------------------------------------
+//
+// Uploads drop originals into /originals and set workPending. loop() drains the
+// queue one image at a time: find an original with no matching /dithered/<base>.bin,
+// run the decode/resize/dither pipeline, and save the .bin. Processing one image
+// briefly blocks the web server (~seconds); the next image is handled on a later
+// loop pass. Failures are parked in a session-only set so they aren't retried in a
+// tight loop. Declared bool so it can be referenced from webserver.ino.
+// --------------------------------------------------
+
+bool isFailedBase(const String& base) {
+  for (int i = 0; i < failedCount; i++) {
+    if (failedBases[i] == base) return true;
+  }
+  return false;
+}
+
+static void markFailedBase(const String& base) {
+  if (isFailedBase(base)) return;
+  if (failedCount < MAX_FAILED) failedBases[failedCount++] = base;
+}
+
+// Forget a base (e.g. on delete) so a re-upload of the same name is retried.
+void clearFailedBase(const String& base) {
+  for (int i = 0; i < failedCount; i++) {
+    if (failedBases[i] == base) {
+      failedBases[i] = failedBases[--failedCount];
+      return;
+    }
+  }
+}
+
+// Strip directory and extension → base name.
+static String baseOf(const String& filename) {
+  String b = filename;
+  int s = b.lastIndexOf('/');
+  if (s >= 0) b = b.substring(s + 1);
+  int dot = b.lastIndexOf('.');
+  if (dot > 0) b = b.substring(0, dot);
+  return b;
+}
+
+// Process at most one pending original. Returns true if it did work (so the
+// caller keeps draining), false when nothing is pending.
+bool processNextPending() {
+  File dir = SD.open(ORIGINALS_DIR);
+  if (!dir) return false;
+
+  String srcPath, base;
+  File e;
+  while ((e = dir.openNextFile())) {
+    if (!e.isDirectory()) {
+      String nm = String(e.name());
+      int s = nm.lastIndexOf('/');
+      if (s >= 0) nm = nm.substring(s + 1);
+      String b = baseOf(nm);
+      String binPath = String(DITHERED_DIR "/") + b + ".bin";
+      if (!SD.exists(binPath) && !isFailedBase(b)) {
+        srcPath = String(ORIGINALS_DIR "/") + nm;
+        base = b;
+        e.close();
+        break;
+      }
+    }
+    e.close();
+  }
+  dir.close();
+
+  if (srcPath.length() == 0) return false;  // nothing pending
+
+  String binPath = String(DITHERED_DIR "/") + base + ".bin";
+  Serial.printf("Dithering: %s -> %s\n", srcPath.c_str(), binPath.c_str());
+  if (!processUploadToBin(srcPath.c_str(), binPath.c_str())) {
+    Serial.printf("Processing failed for %s (parked)\n", srcPath.c_str());
+    markFailedBase(base);
+  }
+  return true;  // advanced the queue either way
 }
 
 // --------------------------------------------------
@@ -285,6 +376,9 @@ void setup() {
     wifiBringUp();        // STA if saved network reachable, else host AP
     webServerBegin();
 
+    // Dither any originals left unprocessed (e.g. power lost mid-batch).
+    workPending = true;
+
     // Show a photo immediately so the panel isn't blank.
     displayRandomFromSD();
 
@@ -295,6 +389,7 @@ void setup() {
     lastSensor = now;
     lastRotate = now;
     lastPowerCheck = now;
+    lastWork = now;
     return;  // fall through to loop()
   }
 
@@ -348,6 +443,16 @@ void loop() {
   webServerHandle();
 
   uint32_t now = millis();
+
+  // Drain the dithering queue one image at a time, but only when the device is
+  // idle (no upload in the last WORK_QUIET_MS) so active uploads stay snappy.
+  if (workPending &&
+      (now - lastUploadMs >= WORK_QUIET_MS) &&
+      (now - lastWork >= WORK_GAP_MS)) {
+    lastWork = millis();
+    if (!processNextPending()) workPending = false;
+    lastWork = millis();  // account for the processing time just spent
+  }
 
   if (now - lastSensor >= SENSOR_INTERVAL_MS) {
     lastSensor = now;

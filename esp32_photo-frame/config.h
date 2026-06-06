@@ -5,6 +5,14 @@
 #include "config_defaults.h"
 
 // --------------------------------------------------
+// SD card folders
+// --------------------------------------------------
+//   /originals/<base>.<ext>  uploaded source images (gallery source)
+//   /dithered/<base>.bin     processed 800x480 4bpp panel buffers (display source)
+#define ORIGINALS_DIR "/originals"
+#define DITHERED_DIR  "/dithered"
+
+// --------------------------------------------------
 // Runtime configuration (persisted in NVS, namespace "cfg")
 // --------------------------------------------------
 //
@@ -22,6 +30,10 @@ extern String   cfgMqttPass;
 // Current WiFi / power state (set during boot).
 extern bool apMode;       // true when hosting our own access point
 extern bool serverMode;   // true when on USB power and running the web server
+
+// Background dithering queue (set by the web upload handler, drained in loop()).
+extern bool     workPending;    // true when originals may need dithering
+extern uint32_t lastUploadMs;   // millis() of the most recent upload
 
 void configLoad();
 void configSaveWifi(const String& ssid, const String& pass);
