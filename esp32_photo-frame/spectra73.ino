@@ -307,6 +307,63 @@ void epdWriteBuffer() {
 }
 
 // --------------------------------------------------
+// FRAMEBUFFER <-> SD CARD (.bin = raw 4bpp panel buffer)
+// --------------------------------------------------
+
+bool epdSaveBufferToFile(const char* path) {
+  if (!epdBuffer) return false;
+
+  if (SD.exists(path)) SD.remove(path);
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) {
+    Serial.print("Failed to open for write: ");
+    Serial.println(path);
+    return false;
+  }
+
+  size_t written = f.write(epdBuffer, EPD_BUF_SIZE);
+  f.close();
+
+  if (written != EPD_BUF_SIZE) {
+    Serial.printf("Short write (%u/%u) to %s\n",
+                  (unsigned)written, (unsigned)EPD_BUF_SIZE, path);
+    SD.remove(path);
+    return false;
+  }
+  return true;
+}
+
+bool epdLoadBufferFromFile(const char* path) {
+  if (!epdBuffer) return false;
+
+  File f = SD.open(path);
+  if (!f) {
+    Serial.print("Failed to open for read: ");
+    Serial.println(path);
+    return false;
+  }
+
+  if (f.size() != EPD_BUF_SIZE) {
+    Serial.printf("Bad .bin size (%u) for %s\n", (unsigned)f.size(), path);
+    f.close();
+    return false;
+  }
+
+  size_t got = f.read(epdBuffer, EPD_BUF_SIZE);
+  f.close();
+  return got == EPD_BUF_SIZE;
+}
+
+// Push the current framebuffer to the panel and put it back to sleep.
+// Safe to call repeatedly (epdPortInit performs a full hardware reset).
+void epdDisplayCurrentBuffer() {
+  epdPortInit();
+  epdWriteBuffer();
+  epdTurnOnDisplay();
+  epdDeepSleep();
+}
+
+// --------------------------------------------------
 // TEST PATTERNS (draw into buffer)
 // --------------------------------------------------
 

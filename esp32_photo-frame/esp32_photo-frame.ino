@@ -3,13 +3,15 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
 #include <PubSubClient.h>
 #include <SD.h>
 #include <XPowersLib.h>
 #include <JPEGDEC.h>
+#include <Preferences.h>
+#include <WebServer.h>
+#include <DNSServer.h>
 #include <driver/rtc_io.h>
-#include "secrets.h"
+#include "config.h"
 
 // --------------------------------------------------
 // Pin Definitions
@@ -59,7 +61,12 @@
 
 #define SLEEP_DURATION_US   (5ULL * 60ULL * 1000000ULL) // 5 minutes
 #define WAKES_PER_UPDATE    6                            // 6 × 5 min = 30 min
-#define TEMP_IMAGE_PATH     "/photo_frame_temp"
+#define PHOTO_DIR_PATH      "/photos"
+
+// Server-mode (USB powered) timers
+#define SENSOR_INTERVAL_MS  (5UL * 60UL * 1000UL)             // 5 minutes
+#define ROTATE_INTERVAL_MS  ((uint32_t)ROTATE_MINUTES * 60UL * 1000UL)
+#define POWER_CHECK_MS      10000UL                           // re-check USB every 10s
 
 // --------------------------------------------------
 // RTC-persistent state (survives deep sleep)
@@ -79,9 +86,10 @@ bool pmuReady = false;
 WiFiClient    mqttWifi;
 PubSubClient  mqtt(mqttWifi);
 
-#define MAX_IMAGES  512
-String imageList[MAX_IMAGES];
-int    imageCount = 0;
+// Server-mode loop timers
+static uint32_t lastSensor     = 0;
+static uint32_t lastRotate     = 0;
+static uint32_t lastPowerCheck = 0;
 
 // --------------------------------------------------
 // PMU
@@ -107,63 +115,75 @@ void logPmu() {
   Serial.println(pmu.isCharging() ? "yes" : "no");
 }
 
-// --------------------------------------------------
-// UPDATE DISPLAY
-// --------------------------------------------------
-
-void updateDisplay() {
-  Serial.println("=== Starting display update ===");
-
-  if (!wifiConnect()) {
-    Serial.println("WiFi failed, skipping update");
-    return;
-  }
-
-  if (!fetchImageList()) {
-    Serial.println("No images found on server");
-    wifiDisconnect();
-    return;
-  }
-
-  // Pick a random image
-  int idx = esp_random() % imageCount;
-  Serial.print("Selected image [");
-  Serial.print(idx);
-  Serial.print("]: ");
-  Serial.println(imageList[idx]);
-
-  // Download to SD card
-  String localPath = String(TEMP_IMAGE_PATH) + getExtension(imageList[idx]);
-  if (!downloadImageToSD(imageList[idx], localPath)) {
-    Serial.println("Download failed");
-    wifiDisconnect();
-    return;
-  }
-
-  wifiDisconnect();
-
-  // Process image: decode → resize → dither → write to EPD buffer
-  if (!processImage(localPath.c_str())) {
-    Serial.println("Image processing failed");
-    SD.remove(localPath);
-    return;
-  }
-
-  // Refresh the display
-  epdWriteBuffer();
-  epdTurnOnDisplay();
-
-  // Clean up temp file
-  SD.remove(localPath);
-
-  Serial.println("=== Display update complete ===");
+// True when running from USB-C power (VBUS present).
+bool pmuVbusPresent() {
+  if (!pmuReady) return false;
+  return pmu.isVbusIn();
 }
 
-// Return file extension including the dot, e.g. ".jpg"
-String getExtension(const String& filename) {
-  int dot = filename.lastIndexOf('.');
-  if (dot < 0) return "";
-  return filename.substring(dot);
+// --------------------------------------------------
+// Display a random pre-processed photo from the SD card
+// --------------------------------------------------
+
+static bool isBinFile(File& e) {
+  if (e.isDirectory()) return false;
+  String low = String(e.name());
+  low.toLowerCase();
+  return low.endsWith(".bin");
+}
+
+bool displayRandomFromSD() {
+  // Pass 1: count the .bin photos.
+  File dir = SD.open(PHOTO_DIR_PATH);
+  if (!dir) {
+    Serial.println("No /photos directory on SD card");
+    return false;
+  }
+  int count = 0;
+  File e;
+  while ((e = dir.openNextFile())) {
+    if (isBinFile(e)) count++;
+    e.close();
+  }
+  dir.close();
+
+  if (count == 0) {
+    Serial.println("No photos on SD card yet");
+    return false;
+  }
+
+  int target = esp_random() % count;
+
+  // Pass 2: walk to the target-th .bin and resolve its path.
+  dir = SD.open(PHOTO_DIR_PATH);
+  String chosen;
+  int i = 0;
+  while ((e = dir.openNextFile())) {
+    if (isBinFile(e)) {
+      if (i == target) {
+        String nm = String(e.name());
+        int s = nm.lastIndexOf('/');
+        if (s >= 0) nm = nm.substring(s + 1);
+        chosen = String(PHOTO_DIR_PATH "/") + nm;
+        e.close();
+        break;
+      }
+      i++;
+    }
+    e.close();
+  }
+  dir.close();
+
+  if (chosen.length() == 0) return false;
+  Serial.printf("Displaying [%d/%d]: %s\n", target, count, chosen.c_str());
+
+  if (!epdLoadBufferFromFile(chosen.c_str())) {
+    Serial.println("Failed to load photo buffer");
+    return false;
+  }
+
+  epdDisplayCurrentBuffer();
+  return true;
 }
 
 // --------------------------------------------------
@@ -178,7 +198,6 @@ void enterDeepSleep() {
   esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
 
   // Button wakeup — GPIO4 active-low (wake on LOW)
-  // Enable RTC pull-up so the pin stays HIGH during deep sleep
   rtc_gpio_pullup_en((gpio_num_t)PIN_BUTTON);
   rtc_gpio_pulldown_dis((gpio_num_t)PIN_BUTTON);
   esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_BUTTON, 0);
@@ -199,6 +218,7 @@ void setup() {
   esp_sleep_wakeup_cause_t wakeReason = esp_sleep_get_wakeup_cause();
   bool buttonWake = (wakeReason == ESP_SLEEP_WAKEUP_EXT0);
   bool timerWake  = (wakeReason == ESP_SLEEP_WAKEUP_TIMER);
+  (void)timerWake;
 
   if (firstBoot) {
     Serial.println("=== First boot ===");
@@ -245,10 +265,42 @@ void setup() {
 
   sensorInit();
 
-  // ----- Decide what to do this wake -----
+  // ----- Load persistent config -----
+
+  configLoad();
+
+  // ----- Choose mode based on power source -----
+
+  bool usbPowered = pmuVbusPresent();
+  Serial.printf("Power source: %s\n",
+                usbPowered ? "USB-C (server mode)" : "battery (sleep mode)");
+
+  if (usbPowered) {
+    // ===== SERVER MODE — stay awake, run the web UI =====
+    serverMode = true;
+
+    if (!epdInit()) Serial.println("WARN: framebuffer alloc failed");
+    if (!sdInit())  Serial.println("WARN: SD card init failed");
+
+    wifiBringUp();        // STA if saved network reachable, else host AP
+    webServerBegin();
+
+    // Show a photo immediately so the panel isn't blank.
+    displayRandomFromSD();
+
+    // Initial sensor report (no-op in AP mode or if MQTT unconfigured).
+    sensorReport();
+
+    uint32_t now = millis();
+    lastSensor = now;
+    lastRotate = now;
+    lastPowerCheck = now;
+    return;  // fall through to loop()
+  }
+
+  // ===== BATTERY MODE — low-power deep-sleep cycle =====
 
   bool doDisplayUpdate = false;
-  bool doSensorReport  = true;  // always report sensor
 
   if (firstBoot) {
     doDisplayUpdate = true;
@@ -256,9 +308,8 @@ void setup() {
     wakeCount = 0;
   } else if (buttonWake) {
     doDisplayUpdate = true;
-    wakeCount = 0;  // reset timer so next display update is 30 min from now
+    wakeCount = 0;
   } else {
-    // Timer wake
     wakeCount++;
     if (wakeCount >= WAKES_PER_UPDATE) {
       doDisplayUpdate = true;
@@ -266,45 +317,55 @@ void setup() {
     }
   }
 
-  Serial.printf("Wake count: %d/%d  display=%s  sensor=%s\n",
-                wakeCount, WAKES_PER_UPDATE,
-                doDisplayUpdate ? "yes" : "no",
-                doSensorReport  ? "yes" : "no");
+  Serial.printf("Wake count: %d/%d  display=%s\n",
+                wakeCount, WAKES_PER_UPDATE, doDisplayUpdate ? "yes" : "no");
 
-  // ----- Sensor report (quick — WiFi + MQTT) -----
+  // Sensor report (quick — WiFi + MQTT)
+  sensorReport();
 
-  if (doSensorReport) {
-    sensorReport();
-  }
-
-  // ----- Display update (heavy — WiFi + download + decode + refresh) -----
-
+  // Display update (rotate a stored photo from the SD card)
   if (doDisplayUpdate) {
-    epdPortInit();
-
-    if (!epdInit()) {
-      Serial.println("FATAL: no framebuffer");
-      enterDeepSleep();
-    }
-
-    if (!sdInit()) {
-      Serial.println("SD card init failed, skipping display update");
+    if (epdInit() && sdInit()) {
+      displayRandomFromSD();
     } else {
-      updateDisplay();
+      Serial.println("Skipping display update (EPD/SD init failed)");
     }
-
-    epdDeepSleep();
   }
-
-  // ----- Sleep -----
 
   enterDeepSleep();
 }
 
 // --------------------------------------------------
-// LOOP (never reached — deep sleep resets to setup)
+// LOOP (only runs in server mode; battery mode never returns from setup)
 // --------------------------------------------------
 
 void loop() {
-  // Should never get here
+  if (!serverMode) {
+    enterDeepSleep();
+    return;
+  }
+
+  webServerHandle();
+
+  uint32_t now = millis();
+
+  if (now - lastSensor >= SENSOR_INTERVAL_MS) {
+    lastSensor = now;
+    sensorReport();
+  }
+
+  if (now - lastRotate >= ROTATE_INTERVAL_MS) {
+    lastRotate = now;
+    displayRandomFromSD();
+  }
+
+  if (now - lastPowerCheck >= POWER_CHECK_MS) {
+    lastPowerCheck = now;
+    if (!pmuVbusPresent()) {
+      Serial.println("USB power removed — switching to battery sleep mode");
+      enterDeepSleep();
+    }
+  }
+
+  delay(2);
 }

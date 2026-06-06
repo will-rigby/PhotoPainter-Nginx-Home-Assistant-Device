@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: 0BSD
 
+#include "config.h"
+
 // --------------------------------------------------
 // SHTC3 Temperature & Humidity → MQTT (Home Assistant)
 // --------------------------------------------------
@@ -122,14 +124,14 @@ static bool shtc3Read(float& tempC, float& humidity) {
 // --------------------------------------------------
 
 static bool mqttConnect() {
-  mqtt.setServer(MQTT_SERVER, MQTT_PORT);
+  mqtt.setServer(cfgMqttHost.c_str(), cfgMqttPort);
   mqtt.setBufferSize(512);
 
   const char* clientId = "ESP32-PhotoFrame";
   bool ok;
 
-  if (strlen(MQTT_USER) > 0) {
-    ok = mqtt.connect(clientId, MQTT_USER, MQTT_PASSWORD);
+  if (cfgMqttUser.length() > 0) {
+    ok = mqtt.connect(clientId, cfgMqttUser.c_str(), cfgMqttPass.c_str());
   } else {
     ok = mqtt.connect(clientId);
   }
@@ -201,10 +203,20 @@ void sensorReport() {
     Serial.printf("Battery: %.2fV\n", vbat);
   }
 
-  // Ensure WiFi is up
+  // No broker configured → nothing to publish.
+  if (cfgMqttHost.length() == 0) {
+    Serial.println("MQTT not configured, skipping report");
+    return;
+  }
+
+  // Ensure WiFi is up. In AP mode there is no uplink, so skip.
   bool weConnectedWifi = false;
   if (WiFi.status() != WL_CONNECTED) {
-    if (!wifiConnect()) {
+    if (apMode) {
+      Serial.println("Hosting AP (no uplink), skipping MQTT report");
+      return;
+    }
+    if (!wifiConnectSTA(cfgWifiSsid, cfgWifiPass)) {
       Serial.println("WiFi failed, skipping MQTT report");
       return;
     }
@@ -237,9 +249,8 @@ void sensorReport() {
 
   Serial.println("MQTT sensor data published");
 
-  // Don't disconnect WiFi here — updateDisplay() manages it,
-  // and we may be mid-wait in loop().
-  // But if we brought WiFi up just for this, tear it down.
+  // In server mode WiFi is already up (STA) and stays connected — leave it.
+  // In battery mode we brought WiFi up just for this report, so tear it down.
   if (weConnectedWifi) {
     mqtt.disconnect();
     wifiDisconnect();
