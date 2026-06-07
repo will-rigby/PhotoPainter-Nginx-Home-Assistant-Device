@@ -34,8 +34,10 @@ static const int PALETTE_SIZE = 6;
 
 static JPEGDEC    jpeg;
 static uint16_t*  jpgDecodeBuf  = nullptr;   // RGB565 decode target
-static int        jpgDecodeW    = 0;
-static int        jpgDecodeH    = 0;
+static int        jpgDecodeW    = 0;         // buffer width (memory stride)
+static int        jpgDecodeH    = 0;         // buffer height
+static int        jpgFillW      = 0;         // actual width JPEGDEC filled
+static int        jpgFillH      = 0;         // actual height JPEGDEC filled
 static File       jpgFile;                   // kept open during decode
 
 // --------------------------------------------------
@@ -63,9 +65,16 @@ static int32_t jpgSeek(JPEGFILE* pFile, int32_t pos) {
   return jpgFile.seek(pos);
 }
 
-// Copy decoded MCU blocks into the linear RGB565 buffer
+// Copy decoded MCU blocks into the linear RGB565 buffer, tracking the actual
+// region JPEGDEC fills (it may not match origW/scale exactly).
 static int jpgDrawCB(JPEGDRAW* pDraw) {
   if (!jpgDecodeBuf) return 0;
+
+  // The callback fires many times during a decode; yield occasionally so the
+  // decode (which runs on the dither task, core 0) doesn't starve the idle task
+  // and trip the watchdog.
+  static uint16_t cbCount = 0;
+  if ((++cbCount & 15) == 0) vTaskDelay(1);
 
   for (int y = 0; y < pDraw->iHeight; y++) {
     int dstY = pDraw->y + y;
@@ -74,8 +83,11 @@ static int jpgDrawCB(JPEGDRAW* pDraw) {
     int srcOff = y * pDraw->iWidth;
     int dstOff = dstY * jpgDecodeW + pDraw->x;
     int w      = min((int)pDraw->iWidth, jpgDecodeW - pDraw->x);
-    if (w > 0)
+    if (w > 0) {
       memcpy(&jpgDecodeBuf[dstOff], &pDraw->pPixels[srcOff], w * 2);
+      if (pDraw->x + w > jpgFillW) jpgFillW = pDraw->x + w;
+      if (dstY + 1     > jpgFillH) jpgFillH = dstY + 1;
+    }
   }
   return 1;
 }
@@ -127,6 +139,9 @@ static bool decodeJPEG(const char* path) {
   }
   memset(jpgDecodeBuf, 0, bufBytes);
 
+  jpgFillW = 0;
+  jpgFillH = 0;
+
   jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
   rc = jpeg.decode(0, 0, scales[best].flag);
   jpeg.close();
@@ -138,7 +153,8 @@ static bool decodeJPEG(const char* path) {
     return false;
   }
 
-  Serial.println("JPEG decoded OK");
+  Serial.printf("JPEG decoded OK — filled %dx%d of %dx%d buffer\n",
+                jpgFillW, jpgFillH, jpgDecodeW, jpgDecodeH);
   return true;
 }
 
@@ -176,6 +192,8 @@ static bool decodeBMP(const char* path) {
 
   jpgDecodeW = bmpW;
   jpgDecodeH = bmpH;
+  jpgFillW   = bmpW;   // BMP path fills the whole buffer
+  jpgFillH   = bmpH;
 
   size_t bufBytes = (size_t)bmpW * bmpH * 2;
   jpgDecodeBuf = (uint16_t*)ps_malloc(bufBytes);
@@ -197,6 +215,7 @@ static bool decodeBMP(const char* path) {
   f.seek(dataOffset);
 
   for (int y = 0; y < bmpH; y++) {
+    if ((y & 31) == 0) vTaskDelay(1);   // yield so core-0 idle/WDT stays happy
     int dstY = bottomUp ? (bmpH - 1 - y) : y;
     f.read(rowBuf, bmpW * 3 + rowPad);
 
@@ -226,9 +245,10 @@ static inline void rgb565to888(uint16_t c, int& r, int& g, int& b) {
   b =  c        & 0x1F; b = (b << 3) | (b >> 2);
 }
 
-// Bilinear sample from an RGB565 buffer
+// Bilinear sample from an RGB565 buffer. srcW/srcH are the valid content size;
+// srcStride is the buffer's row stride in pixels (may be larger than srcW).
 static void sampleBilinear(float sx, float sy,
-                           int srcW, int srcH,
+                           int srcW, int srcH, int srcStride,
                            const uint16_t* src,
                            int& r, int& g, int& b) {
   int x0 = (int)sx;
@@ -240,10 +260,10 @@ static void sampleBilinear(float sx, float sy,
 
   int r00, g00, b00, r10, g10, b10;
   int r01, g01, b01, r11, g11, b11;
-  rgb565to888(src[y0 * srcW + x0], r00, g00, b00);
-  rgb565to888(src[y0 * srcW + x1], r10, g10, b10);
-  rgb565to888(src[y1 * srcW + x0], r01, g01, b01);
-  rgb565to888(src[y1 * srcW + x1], r11, g11, b11);
+  rgb565to888(src[y0 * srcStride + x0], r00, g00, b00);
+  rgb565to888(src[y0 * srcStride + x1], r10, g10, b10);
+  rgb565to888(src[y1 * srcStride + x0], r01, g01, b01);
+  rgb565to888(src[y1 * srcStride + x1], r11, g11, b11);
 
   float w00 = (1 - fx) * (1 - fy);
   float w10 = fx       * (1 - fy);
@@ -260,7 +280,7 @@ static void sampleBilinear(float sx, float sy,
 // Returns RGB888 buffer (3 bytes / pixel) in PSRAM.
 // --------------------------------------------------
 
-static uint8_t* resizeToDisplay(int srcW, int srcH,
+static uint8_t* resizeToDisplay(int srcW, int srcH, int srcStride,
                                 const uint16_t* src) {
   size_t outBytes = (size_t)EPD_WIDTH * EPD_HEIGHT * 3;
   uint8_t* out = (uint8_t*)ps_malloc(outBytes);
@@ -281,6 +301,7 @@ static uint8_t* resizeToDisplay(int srcW, int srcH,
                 scale, startX, startY);
 
   for (int dy = 0; dy < EPD_HEIGHT; dy++) {
+    if ((dy & 31) == 0) vTaskDelay(1);   // yield so core-0 idle/WDT stays happy
     for (int dx = 0; dx < EPD_WIDTH; dx++) {
       float sx = startX + dx / scale;
       float sy = startY + dy / scale;
@@ -288,7 +309,7 @@ static uint8_t* resizeToDisplay(int srcW, int srcH,
       sy = max(0.0f, min(sy, (float)(srcH - 1)));
 
       int r, g, b;
-      sampleBilinear(sx, sy, srcW, srcH, src, r, g, b);
+      sampleBilinear(sx, sy, srcW, srcH, srcStride, src, r, g, b);
 
       int idx = (dy * EPD_WIDTH + dx) * 3;
       out[idx + 0] = r;
@@ -327,7 +348,7 @@ static int nearestPaletteColor(int r, int g, int b) {
 // Floyd–Steinberg dither (RGB888 → 6-colour EPD buffer)
 // --------------------------------------------------
 
-static void floydSteinbergDither(uint8_t* rgb, int w, int h) {
+static void floydSteinbergDither(uint8_t* dst, uint8_t* rgb, int w, int h) {
   Serial.println("Floyd-Steinberg dithering...");
 
   // Two rows of signed error accumulators (R, G, B per pixel)
@@ -348,6 +369,8 @@ static void floydSteinbergDither(uint8_t* rgb, int w, int h) {
   }
 
   for (int y = 0; y < h; y++) {
+    if ((y & 31) == 0) vTaskDelay(1);   // yield so core-0 idle/WDT stays happy
+
     // Prepare next-row base values
     if (y + 1 < h) {
       int off = (y + 1) * w * 3;
@@ -370,7 +393,7 @@ static void floydSteinbergDither(uint8_t* rgb, int w, int h) {
       int b = max(0, min(255, (int)errCur[si + 2]));
 
       int palIdx = nearestPaletteColor(r, g, b);
-      epdSetPixel(x, y, paletteEPD[palIdx]);
+      epdSetPixelBuf(dst, x, y, paletteEPD[palIdx]);
 
       int eR = r - paletteRGB[palIdx][0];
       int eG = g - paletteRGB[palIdx][1];
@@ -411,59 +434,48 @@ static void floydSteinbergDither(uint8_t* rgb, int w, int h) {
 }
 
 // --------------------------------------------------
-// Processing pipeline entry: decode/resize/dither a source image into the EPD
-// framebuffer, then persist the framebuffer as a .bin on the SD card.
-// Called by the background queue (USB power) so the heavy work is off-battery.
+// Two-phase pipeline (so the background task can hold the SD lock only while
+// it actually touches the card):
+//   imgDecode()         — reads the source file from SD into jpgDecodeBuf  [SD]
+//   imgRenderToBuffer() — resize + dither into the caller's buffer         [CPU]
+// The JPEGDEC globals (jpgDecodeBuf, jpgFillW/H, …) are touched only by the
+// dither task, so they need no locking themselves.
 // --------------------------------------------------
 
-bool processUploadToBin(const char* srcPath, const char* outBinPath) {
-  if (!processImage(srcPath)) {
-    Serial.println("Processing failed (decode/resize/dither)");
-    return false;
-  }
-  if (!epdSaveBufferToFile(outBinPath)) {
-    Serial.println("Failed to save processed .bin");
-    return false;
-  }
-  Serial.print("Saved processed image: ");
-  Serial.println(outBinPath);
-  return true;
-}
-
-bool processImage(const char* filepath) {
-  Serial.print("Processing: ");
+bool imgDecode(const char* filepath) {
+  Serial.print("Decoding: ");
   Serial.println(filepath);
 
   String path = String(filepath);
   path.toLowerCase();
 
-  bool decoded = false;
-
   if (path.endsWith(".jpg") || path.endsWith(".jpeg")) {
-    decoded = decodeJPEG(filepath);
+    return decodeJPEG(filepath);
   } else if (path.endsWith(".bmp")) {
-    decoded = decodeBMP(filepath);
-  } else {
-    Serial.println("Unsupported image format (only JPEG/BMP)");
-    return false;
+    return decodeBMP(filepath);
   }
+  Serial.println("Unsupported image format (only JPEG/BMP)");
+  return false;
+}
 
-  if (!decoded) return false;
+bool imgRenderToBuffer(uint8_t* target) {
+  // Resize from the region actually filled by the decoder (jpgFillW/H), using
+  // the buffer width (jpgDecodeW) as the row stride. Robust even if the decoder
+  // filled less than the full allocated buffer.
+  int contentW = (jpgFillW > 0 && jpgFillW <= jpgDecodeW) ? jpgFillW : jpgDecodeW;
+  int contentH = (jpgFillH > 0 && jpgFillH <= jpgDecodeH) ? jpgFillH : jpgDecodeH;
+  Serial.printf("Resizing from content %dx%d (stride %d)\n",
+                contentW, contentH, jpgDecodeW);
+  uint8_t* resized = resizeToDisplay(contentW, contentH, jpgDecodeW, jpgDecodeBuf);
 
-  // Resize to EPD dimensions (cover + centre crop)
-  uint8_t* resized = resizeToDisplay(jpgDecodeW, jpgDecodeH, jpgDecodeBuf);
-
-  // Free the decode buffer immediately
   free(jpgDecodeBuf);
   jpgDecodeBuf = nullptr;
 
   if (!resized) return false;
 
-  // Dither into the EPD framebuffer
-  floydSteinbergDither(resized, EPD_WIDTH, EPD_HEIGHT);
+  floydSteinbergDither(target, resized, EPD_WIDTH, EPD_HEIGHT);
 
   free(resized);
-
-  Serial.println("Image processing complete");
+  Serial.println("Image rendering complete");
   return true;
 }

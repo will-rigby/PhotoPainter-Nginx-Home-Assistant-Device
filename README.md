@@ -150,7 +150,7 @@ A photo shows as *processing* in the gallery until its `/dithered/<base>.bin` ex
 ## Image pipeline (upload → background dithering)
 
 1. The browser uploads one or more JPEG/BMP files to `/upload`; each is streamed straight into `/originals` and the request returns immediately (no blocking).
-2. The frame drains a **background queue** (`processNextPending()` in [esp32_photo-frame.ino](esp32_photo-frame/esp32_photo-frame.ino)), one image at a time between web requests, so the UI stays responsive while a batch processes.
+2. A **background queue** (`processNextPending()` in [esp32_photo-frame.ino](esp32_photo-frame/esp32_photo-frame.ino)) drains in `loop()`, one image at a time, so uploads return immediately and processing proceeds while the gallery updates. Non-image files on the card are ignored.
 3. For each pending original, `processImage()` in [image_processing.ino](esp32_photo-frame/image_processing.ino) decodes it, picks the most aggressive downscale that still covers 800×480, and bilinear-resizes (cover + centred crop) into an RGB888 buffer in PSRAM.
 4. The Floyd–Steinberg stage converts the RGB data into the 6-colour ACeP palette directly in the panel framebuffer, which is then written to `/dithered/<base>.bin` (`epdSaveBufferToFile`).
 5. At display time the frame just loads a `.bin` back into the framebuffer (`epdLoadBufferFromFile`) and refreshes the panel — no decoding needed, which keeps battery refreshes fast and cheap.

@@ -94,12 +94,14 @@ static uint32_t lastRotate     = 0;
 static uint32_t lastPowerCheck = 0;
 static uint32_t lastWork       = 0;
 
-// Background dithering queue state (server mode). workPending and lastUploadMs
-// are also set from the web upload handler in webserver.ino.
+// Background dithering queue state. workPending and lastUploadMs are also set
+// from the web upload handler in webserver.ino. The queue is drained one image
+// at a time in loop() (server mode).
 bool       workPending  = false;
 uint32_t   lastUploadMs = 0;
-static String failedBases[MAX_FAILED];
-static int    failedCount = 0;
+static String   failedBases[MAX_FAILED];
+static int      failedCount = 0;
+static uint8_t* ditherBuf   = nullptr;   // scratch panel buffer for dithering
 
 // --------------------------------------------------
 // PMU
@@ -184,28 +186,27 @@ bool displayRandomFromSD() {
   }
   dir.close();
 
-  if (chosen.length() == 0) return false;
-  Serial.printf("Displaying [%d/%d]: %s\n", target, count, chosen.c_str());
-
-  if (!epdLoadBufferFromFile(chosen.c_str())) {
+  if (chosen.length() == 0 || !epdLoadBufferFromFile(chosen.c_str())) {
     Serial.println("Failed to load photo buffer");
     return false;
   }
+  Serial.printf("Displaying [%d/%d]: %s\n", target, count, chosen.c_str());
 
   epdDisplayCurrentBuffer();
   return true;
 }
 
 // --------------------------------------------------
-// Background dithering queue (server mode)
+// Background dithering queue (drained in loop(), server mode)
 // --------------------------------------------------
 //
 // Uploads drop originals into /originals and set workPending. loop() drains the
-// queue one image at a time: find an original with no matching /dithered/<base>.bin,
-// run the decode/resize/dither pipeline, and save the .bin. Processing one image
-// briefly blocks the web server (~seconds); the next image is handled on a later
-// loop pass. Failures are parked in a session-only set so they aren't retried in a
-// tight loop. Declared bool so it can be referenced from webserver.ino.
+// queue one image at a time: find an original with no matching .bin, decode,
+// resize + dither into ditherBuf, and save it. Processing one image briefly
+// blocks the web server (~seconds); the next image is handled on a later loop
+// pass. Failures are parked in a session-only set so they aren't retried in a
+// tight loop. The decode/resize/dither loops yield periodically (vTaskDelay) so
+// long jobs don't starve the idle task / trip the watchdog.
 // --------------------------------------------------
 
 bool isFailedBase(const String& base) {
@@ -223,11 +224,20 @@ static void markFailedBase(const String& base) {
 // Forget a base (e.g. on delete) so a re-upload of the same name is retried.
 void clearFailedBase(const String& base) {
   for (int i = 0; i < failedCount; i++) {
-    if (failedBases[i] == base) {
-      failedBases[i] = failedBases[--failedCount];
-      return;
-    }
+    if (failedBases[i] == base) { failedBases[i] = failedBases[--failedCount]; return; }
   }
+}
+
+// Forget all failures (e.g. on "re-dither all") so everything is retried.
+void clearAllFailed() {
+  failedCount = 0;
+}
+
+// True for filenames we can actually decode (ignores stray files on the card).
+static bool hasImageExt(const String& nm) {
+  String low = nm;
+  low.toLowerCase();
+  return low.endsWith(".jpg") || low.endsWith(".jpeg") || low.endsWith(".bmp");
 }
 
 // Strip directory and extension → base name.
@@ -243,6 +253,8 @@ static String baseOf(const String& filename) {
 // Process at most one pending original. Returns true if it did work (so the
 // caller keeps draining), false when nothing is pending.
 bool processNextPending() {
+  if (!ditherBuf) return false;
+
   File dir = SD.open(ORIGINALS_DIR);
   if (!dir) return false;
 
@@ -254,8 +266,9 @@ bool processNextPending() {
       int s = nm.lastIndexOf('/');
       if (s >= 0) nm = nm.substring(s + 1);
       String b = baseOf(nm);
-      String binPath = String(DITHERED_DIR "/") + b + ".bin";
-      if (!SD.exists(binPath) && !isFailedBase(b)) {
+      if (hasImageExt(nm) &&
+          !SD.exists(String(DITHERED_DIR "/") + b + ".bin") &&
+          !isFailedBase(b)) {
         srcPath = String(ORIGINALS_DIR "/") + nm;
         base = b;
         e.close();
@@ -270,7 +283,10 @@ bool processNextPending() {
 
   String binPath = String(DITHERED_DIR "/") + base + ".bin";
   Serial.printf("Dithering: %s -> %s\n", srcPath.c_str(), binPath.c_str());
-  if (!processUploadToBin(srcPath.c_str(), binPath.c_str())) {
+
+  if (!imgDecode(srcPath.c_str()) ||
+      !imgRenderToBuffer(ditherBuf) ||
+      !epdSaveBufferToFile(binPath.c_str(), ditherBuf)) {
     Serial.printf("Processing failed for %s (parked)\n", srcPath.c_str());
     markFailedBase(base);
   }
@@ -376,6 +392,11 @@ void setup() {
     wifiBringUp();        // STA if saved network reachable, else host AP
     webServerBegin();
 
+    // Scratch buffer the background dithering renders into (kept allocated).
+    ditherBuf = (uint8_t*)ps_malloc(EPD_BUF_SIZE);
+    if (!ditherBuf) ditherBuf = (uint8_t*)malloc(EPD_BUF_SIZE);
+    if (!ditherBuf) Serial.println("WARN: dither buffer alloc failed");
+
     // Dither any originals left unprocessed (e.g. power lost mid-batch).
     workPending = true;
 
@@ -444,12 +465,25 @@ void loop() {
 
   uint32_t now = millis();
 
+  // GPIO4 button cycles to another image (edge-triggered + debounced so a held
+  // button is one image, not a tight refresh loop).
+  static bool btnPrev = HIGH;
+  bool btnNow = digitalRead(PIN_BUTTON);     // LOW = pressed (active-low)
+  if (btnPrev == HIGH && btnNow == LOW) {
+    delay(20);                               // debounce
+    if (digitalRead(PIN_BUTTON) == LOW) {
+      Serial.println("Button pressed — cycling image");
+      displayRandomFromSD();
+      lastRotate = millis();                 // restart the auto-rotate timer
+    }
+  }
+  btnPrev = btnNow;
+
   // Drain the dithering queue one image at a time, but only when the device is
   // idle (no upload in the last WORK_QUIET_MS) so active uploads stay snappy.
   if (workPending &&
       (now - lastUploadMs >= WORK_QUIET_MS) &&
       (now - lastWork >= WORK_GAP_MS)) {
-    lastWork = millis();
     if (!processNextPending()) workPending = false;
     lastWork = millis();  // account for the processing time just spent
   }

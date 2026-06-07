@@ -214,18 +214,22 @@ void epdClear(uint8_t color) {
   memset(epdBuffer, packed, EPD_BUF_SIZE);
 }
 
-void epdSetPixel(int x, int y, uint8_t color) {
-  if (!epdBuffer) return;
+// Set a pixel in an arbitrary 4bpp panel buffer (lets the background dither
+// task write into its own buffer instead of the shared framebuffer).
+void epdSetPixelBuf(uint8_t* buf, int x, int y, uint8_t color) {
+  if (!buf) return;
   if (x < 0 || x >= EPD_WIDTH || y < 0 || y >= EPD_HEIGHT) return;
 
   uint32_t idx = (uint32_t)y * EPD_ROW_BYTES + (x / 2);
   if (x & 1) {
-    // Low nibble (right pixel)
-    epdBuffer[idx] = (epdBuffer[idx] & 0xF0) | (color & 0x0F);
+    buf[idx] = (buf[idx] & 0xF0) | (color & 0x0F);   // low nibble (right pixel)
   } else {
-    // High nibble (left pixel)
-    epdBuffer[idx] = (epdBuffer[idx] & 0x0F) | ((color & 0x0F) << 4);
+    buf[idx] = (buf[idx] & 0x0F) | ((color & 0x0F) << 4);  // high nibble (left)
   }
+}
+
+void epdSetPixel(int x, int y, uint8_t color) {
+  epdSetPixelBuf(epdBuffer, x, y, color);
 }
 
 uint8_t epdGetPixel(int x, int y) {
@@ -309,9 +313,19 @@ void epdWriteBuffer() {
 // --------------------------------------------------
 // FRAMEBUFFER <-> SD CARD (.bin = raw 4bpp panel buffer)
 // --------------------------------------------------
+//
+// epdBuffer lives in PSRAM (ps_malloc). The SD-over-SPI driver uses DMA, which
+// cannot read from / write to PSRAM, so we must NOT hand the PSRAM pointer
+// straight to f.read()/f.write() — doing so silently corrupts large transfers
+// (images come back partial / shifted). Instead bounce through this small
+// internal-RAM (DMA-safe) buffer in chunks. The CPU copy to/from PSRAM is fine;
+// only DMA can't touch PSRAM. This mirrors how epdWriteBuffer() bounces through
+// a stack buffer before SPI.
+//
+static uint8_t sdIoBuf[4096];   // internal DRAM, DMA-safe bounce buffer
 
-bool epdSaveBufferToFile(const char* path) {
-  if (!epdBuffer) return false;
+bool epdSaveBufferToFile(const char* path, const uint8_t* buf) {
+  if (!buf) return false;
 
   if (SD.exists(path)) SD.remove(path);
   File f = SD.open(path, FILE_WRITE);
@@ -321,12 +335,19 @@ bool epdSaveBufferToFile(const char* path) {
     return false;
   }
 
-  size_t written = f.write(epdBuffer, EPD_BUF_SIZE);
+  size_t total = 0;
+  bool ok = true;
+  while (total < (size_t)EPD_BUF_SIZE) {
+    size_t n = min(sizeof(sdIoBuf), (size_t)EPD_BUF_SIZE - total);
+    memcpy(sdIoBuf, buf + total, n);           // source -> internal RAM
+    if (f.write(sdIoBuf, n) != n) { ok = false; break; }
+    total += n;
+  }
   f.close();
 
-  if (written != EPD_BUF_SIZE) {
+  if (!ok) {
     Serial.printf("Short write (%u/%u) to %s\n",
-                  (unsigned)written, (unsigned)EPD_BUF_SIZE, path);
+                  (unsigned)total, (unsigned)EPD_BUF_SIZE, path);
     SD.remove(path);
     return false;
   }
@@ -349,9 +370,22 @@ bool epdLoadBufferFromFile(const char* path) {
     return false;
   }
 
-  size_t got = f.read(epdBuffer, EPD_BUF_SIZE);
+  size_t total = 0;
+  while (total < (size_t)EPD_BUF_SIZE) {
+    size_t want = min(sizeof(sdIoBuf), (size_t)EPD_BUF_SIZE - total);
+    size_t got  = f.read(sdIoBuf, want);       // SD -> internal RAM
+    if (got == 0) break;
+    memcpy(epdBuffer + total, sdIoBuf, got);   // internal RAM -> PSRAM
+    total += got;
+  }
   f.close();
-  return got == EPD_BUF_SIZE;
+
+  if (total != (size_t)EPD_BUF_SIZE) {
+    Serial.printf("Short read (%u/%u) for %s\n",
+                  (unsigned)total, (unsigned)EPD_BUF_SIZE, path);
+    return false;
+  }
+  return true;
 }
 
 // Push the current framebuffer to the panel and put it back to sleep.

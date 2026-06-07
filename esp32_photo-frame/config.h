@@ -35,6 +35,9 @@ extern bool serverMode;   // true when on USB power and running the web server
 extern bool     workPending;    // true when originals may need dithering
 extern uint32_t lastUploadMs;   // millis() of the most recent upload
 
+// Failed-image set (image bases whose processing failed).
+bool isFailedBase(const String& base);
+
 void configLoad();
 void configSaveWifi(const String& ssid, const String& pass);
 void configSaveMqtt(const String& host, uint16_t port,

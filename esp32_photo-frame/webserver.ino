@@ -124,7 +124,9 @@ static const char PAGE_INDEX[] PROGMEM =
   "<nav><a href='/'>Gallery</a><a href='/wifi'>WiFi</a><a href='/mqtt'>MQTT</a></nav><main>"
   "<h1>Photo Gallery</h1>"
   "<form onsubmit='return up(event)'><input type=file id=file accept='.jpg,.jpeg,.bmp' multiple>"
-  "<button>Upload</button></form><span id=status></span>"
+  "<button>Upload</button> <button type=button onclick='redither()'>Re-dither all</button>"
+  " <button type=button onclick='testpat()'>Test pattern</button>"
+  "</form><span id=status></span>"
   "<div id=grid></div></main><script>"
   "let pollT=null;"
   "async function load(){const a=await(await fetch('/api/photos')).json();"
@@ -145,6 +147,11 @@ static const char PAGE_INDEX[] PROGMEM =
   "alert('Refreshing the panel \\u2014 this takes ~30s.');}"
   "async function del(n){if(!confirm('Delete '+n+'?'))return;"
   "await fetch('/delete?file='+encodeURIComponent(n),{method:'POST'});load();}"
+  "async function redither(){if(!confirm('Re-dither all photos? The panel images are rebuilt from your originals.'))return;"
+  "const s=document.getElementById('status');s.textContent='Re-dithering\\u2026';"
+  "await fetch('/redither',{method:'POST'});load();}"
+  "async function testpat(){await fetch('/test',{method:'POST'});"
+  "alert('Drawing colour bars \\u2014 the panel should fill top-to-bottom with 6 stripes (~30s).');}"
   "async function up(e){e.preventDefault();const fs=document.getElementById('file').files;"
   "if(!fs.length)return false;const s=document.getElementById('status');"
   "for(let i=0;i<fs.length;i++){s.textContent='Uploading '+(i+1)+'/'+fs.length+'\\u2026';"
@@ -290,7 +297,8 @@ static void handleShow() {
   String name = safeName(server.arg("file"));
   if (!validImageName(name)) { server.send(400, "application/json", "{\"ok\":false}"); return; }
   String bin = String(DITHERED_DIR "/") + baseNoExt(name) + ".bin";
-  if (!SD.exists(bin) || !epdLoadBufferFromFile(bin.c_str())) {
+  bool loaded = SD.exists(bin) && epdLoadBufferFromFile(bin.c_str());
+  if (!loaded) {
     server.send(404, "application/json", "{\"ok\":false,\"error\":\"not ready\"}");
     return;
   }
@@ -317,7 +325,6 @@ static void handleUpload() {
     String path = String(ORIGINALS_DIR "/") + base + ext;
     int n = 1;
     while (SD.exists(path)) path = String(ORIGINALS_DIR "/") + base + "_" + String(n++) + ext;
-
     uploadFile = SD.open(path.c_str(), FILE_WRITE);
     if (uploadFile) uploadFinalName = baseNameOf(path);
   } else if (up.status == UPLOAD_FILE_WRITE) {
@@ -326,7 +333,7 @@ static void handleUpload() {
     if (uploadFile) {
       uploadFile.close();
       uploadStored = true;
-      workPending = true;          // tell loop() there's dithering to do
+      workPending = true;          // tell the dither task there's work
       lastUploadMs = millis();
     }
   }
@@ -339,6 +346,44 @@ static void handleUploadDone() {
   }
   server.send(200, "application/json",
               "{\"ok\":true,\"name\":\"" + jsonEscape(uploadFinalName) + "\"}");
+}
+
+// Delete every dithered buffer; the background queue rebuilds them from the
+// originals. Use after changing the dither pipeline or to recover corrupt .bins.
+static void handleRedither() {
+  int removed = 0;
+  while (true) {
+    File dir = SD.open(DITHERED_DIR);
+    if (!dir) break;
+    String victim;
+    File e;
+    while ((e = dir.openNextFile())) {
+      if (!e.isDirectory()) {
+        String n = baseNameOf(String(e.name()));
+        String low = n; low.toLowerCase();
+        if (low.endsWith(".bin")) { victim = String(DITHERED_DIR "/") + n; e.close(); break; }
+      }
+      e.close();
+    }
+    dir.close();
+    if (victim.length() == 0) break;     // no more .bin files
+    if (!SD.remove(victim)) break;       // stop if a delete fails
+    removed++;
+  }
+
+  clearAllFailed();
+  workPending = true;                    // let the dither task rebuild from /originals
+  server.send(200, "application/json", "{\"ok\":true,\"removed\":" + String(removed) + "}");
+}
+
+// Diagnostic: draw 6 colour bars straight into the framebuffer and display them.
+// Bypasses SD / decode / dither / .bin entirely, so it isolates the panel write
+// path from the image pipeline. If the bars fill the screen but photos don't,
+// the problem is in the image/.bin path, not the EPD driver.
+static void handleTest() {
+  epdDrawHorizontalBars();
+  server.send(200, "application/json", "{\"ok\":true}");
+  epdDisplayCurrentBuffer();
 }
 
 static void handleSaveWifi() {
@@ -380,6 +425,8 @@ void webServerBegin() {
   server.on("/original",   HTTP_GET,  handleOriginal);
   server.on("/delete",     HTTP_POST, handleDelete);
   server.on("/show",       HTTP_POST, handleShow);
+  server.on("/redither",   HTTP_POST, handleRedither);
+  server.on("/test",       HTTP_POST, handleTest);
   server.on("/upload",     HTTP_POST, handleUploadDone, handleUpload);
   server.on("/api/wifi",   HTTP_POST, handleSaveWifi);
   server.on("/api/mqtt",   HTTP_POST, handleSaveMqtt);
