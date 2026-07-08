@@ -7,8 +7,9 @@
 // --------------------------------------------------
 // SD card folders
 // --------------------------------------------------
-//   /originals/<base>.<ext>  uploaded source images (gallery source)
-//   /dithered/<base>.bin     processed 800x480 4bpp panel buffers (display source)
+//   /originals/<base>.<ext>  uploaded source images (gallery + display source)
+//   /dithered/<base>.bin     lazily built display cache (800x480 4bpp panel
+//                            buffers, rendered on first display, reused after)
 #define ORIGINALS_DIR "/originals"
 #define DITHERED_DIR  "/dithered"
 
@@ -31,9 +32,14 @@ extern String   cfgMqttPass;
 extern bool apMode;       // true when hosting our own access point
 extern bool serverMode;   // true when on USB power and running the web server
 
-// Background dithering queue (set by the web upload handler, drained in loop()).
-extern bool     workPending;    // true when originals may need dithering
-extern uint32_t lastUploadMs;   // millis() of the most recent upload
+// Panel framebuffer (allocated by epdInit() in spectra73.ino). The lazy
+// render pipeline dithers directly into it.
+extern uint8_t* epdBuffer;
+
+// Lazy dither cache: make sure /dithered/<base>.bin exists for the given
+// original (basename with extension) and leave the image in epdBuffer, ready
+// for epdDisplayCurrentBuffer(). Defined in esp32_photo-frame.ino.
+bool ensureDitheredInBuffer(const String& origName);
 
 // Failed-image set (image bases whose processing failed).
 bool isFailedBase(const String& base);

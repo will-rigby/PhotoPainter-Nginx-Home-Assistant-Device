@@ -8,17 +8,18 @@
 //   GET  /             gallery page (shows original photos)
 //   GET  /wifi         WiFi settings page
 //   GET  /mqtt         MQTT settings page
-//   GET  /api/photos   JSON list of originals with ready/failed status
+//   GET  /api/photos   JSON list of originals with cached/failed status
 //   GET  /api/config   current (non-secret) config for prefilling forms
 //   GET  /original?file= stream an original image from /originals
-//   POST /upload       multipart upload -> store original in /originals (no blocking)
-//   POST /delete?file= remove a photo (original + dithered)
-//   POST /show?file=   display a photo's dithered buffer on the panel now
+//   POST /upload       multipart upload -> store original in /originals
+//   POST /delete?file= remove a photo (original + cached buffer)
+//   POST /show?file=   render (if uncached) and display a photo now
 //   POST /api/wifi     save WiFi credentials
 //   POST /api/mqtt     save MQTT settings
 //
-// Uploaded originals are dithered into /dithered/<base>.bin in the background by
-// the queue in esp32_photo-frame.ino (processNextPending), so uploads never block.
+// Photos are decoded + dithered lazily at display time (ensureDitheredInBuffer
+// in esp32_photo-frame.ino) and cached as /dithered/<base>.bin, so uploads just
+// store the original and return.
 //
 
 #include <WebServer.h>
@@ -124,39 +125,36 @@ static const char PAGE_INDEX[] PROGMEM =
   "<nav><a href='/'>Gallery</a><a href='/wifi'>WiFi</a><a href='/mqtt'>MQTT</a></nav><main>"
   "<h1>Photo Gallery</h1>"
   "<form onsubmit='return up(event)'><input type=file id=file accept='.jpg,.jpeg,.bmp' multiple>"
-  "<button>Upload</button> <button type=button onclick='redither()'>Re-dither all</button>"
+  "<button>Upload</button> <button type=button onclick='redither()'>Clear dither cache</button>"
   " <button type=button onclick='testpat()'>Test pattern</button>"
   "</form><span id=status></span>"
   "<div id=grid></div></main><script>"
-  "let pollT=null;"
   "async function load(){const a=await(await fetch('/api/photos')).json();"
   "const g=document.getElementById('grid');g.innerHTML='';"
   "if(!a.length){g.innerHTML='<p>No photos yet. Upload some above.</p>';}"
-  "let busy=false;"
   "for(const p of a){const n=p.name;const d=document.createElement('div');d.className='card';"
-  "let badge=p.ready?\"<span class=ok>ready</span>\":(p.failed?\"<span class=bad>failed</span>\":\"<span class=proc>processing\\u2026</span>\");"
-  "if(!p.ready&&!p.failed)busy=true;"
+  "let badge=p.cached?\"<span class=ok>cached</span>\":(p.failed?\"<span class=bad>failed</span>\":\"<span class=proc>not cached</span>\");"
   "d.innerHTML=\"<img loading=lazy src='/original?file=\"+encodeURIComponent(n)+\"'>\"+"
   "\"<div class=name>\"+n+\" \"+badge+\"</div><div class=btns>\"+"
-  "\"<button \"+(p.ready?'':'disabled')+\" onclick=\\\"show('\"+n+\"')\\\">Show</button>\"+"
+  "\"<button onclick=\\\"show('\"+n+\"')\\\">Show</button>\"+"
   "\"<button class=del onclick=\\\"del('\"+n+\"')\\\">Delete</button></div>\";"
-  "g.appendChild(d);}"
-  "if(busy){if(!pollT)pollT=setInterval(load,2000);}else{if(pollT){clearInterval(pollT);pollT=null;}}}"
-  "async function show(n){if(!confirm('Display this photo on the frame now?'))return;"
-  "await fetch('/show?file='+encodeURIComponent(n),{method:'POST'});"
-  "alert('Refreshing the panel \\u2014 this takes ~30s.');}"
+  "g.appendChild(d);}}"
+  "async function show(n){if(!confirm('Display this photo on the frame now? Uncached photos take a few extra seconds to prepare.'))return;"
+  "const r=await fetch('/show?file='+encodeURIComponent(n),{method:'POST'});"
+  "if(!r.ok){alert('Processing failed.');load();return;}"
+  "alert('Refreshing the panel \\u2014 this takes ~30s.');load();}"
   "async function del(n){if(!confirm('Delete '+n+'?'))return;"
   "await fetch('/delete?file='+encodeURIComponent(n),{method:'POST'});load();}"
-  "async function redither(){if(!confirm('Re-dither all photos? The panel images are rebuilt from your originals.'))return;"
-  "const s=document.getElementById('status');s.textContent='Re-dithering\\u2026';"
-  "await fetch('/redither',{method:'POST'});load();}"
+  "async function redither(){if(!confirm('Clear the dither cache? Cached panel images are rebuilt automatically the next time each photo is displayed.'))return;"
+  "const s=document.getElementById('status');s.textContent='Clearing cache\\u2026';"
+  "await fetch('/redither',{method:'POST'});s.textContent='Cache cleared.';load();}"
   "async function testpat(){await fetch('/test',{method:'POST'});"
   "alert('Drawing colour bars \\u2014 the panel should fill top-to-bottom with 6 stripes (~30s).');}"
   "async function up(e){e.preventDefault();const fs=document.getElementById('file').files;"
   "if(!fs.length)return false;const s=document.getElementById('status');"
   "for(let i=0;i<fs.length;i++){s.textContent='Uploading '+(i+1)+'/'+fs.length+'\\u2026';"
   "const fd=new FormData();fd.append('file',fs[i]);try{await fetch('/upload',{method:'POST',body:fd});}catch(err){}}"
-  "s.textContent='Uploaded '+fs.length+' file(s). Processing\\u2026';"
+  "s.textContent='Uploaded '+fs.length+' file(s).';"
   "document.getElementById('file').value='';load();return false;}"
   "window.onload=load;</script></body></html>";
 
@@ -240,12 +238,12 @@ static void handleApiPhotos() {
         String n = baseNameOf(String(e.name()));
         if (validImageName(n)) {
           String base = baseNoExt(n);
-          bool ready  = SD.exists(String(DITHERED_DIR "/") + base + ".bin");
-          bool failed = !ready && isFailedBase(base);
+          bool cached = SD.exists(String(DITHERED_DIR "/") + base + ".bin");
+          bool failed = !cached && isFailedBase(base);
           if (!first) json += ",";
           first = false;
-          json += "{\"name\":\"" + jsonEscape(n) + "\",\"ready\":" +
-                  (ready ? "true" : "false") + ",\"failed\":" +
+          json += "{\"name\":\"" + jsonEscape(n) + "\",\"cached\":" +
+                  (cached ? "true" : "false") + ",\"failed\":" +
                   (failed ? "true" : "false") + "}";
         }
       }
@@ -296,18 +294,22 @@ static void handleDelete() {
 static void handleShow() {
   String name = safeName(server.arg("file"));
   if (!validImageName(name)) { server.send(400, "application/json", "{\"ok\":false}"); return; }
-  String bin = String(DITHERED_DIR "/") + baseNoExt(name) + ".bin";
-  bool loaded = SD.exists(bin) && epdLoadBufferFromFile(bin.c_str());
-  if (!loaded) {
-    server.send(404, "application/json", "{\"ok\":false,\"error\":\"not ready\"}");
+  if (!SD.exists(String(ORIGINALS_DIR "/") + name)) {
+    server.send(404, "application/json", "{\"ok\":false,\"error\":\"no such photo\"}");
+    return;
+  }
+  // May take a few seconds on a cache miss (decode + dither); the WebServer is
+  // synchronous, so the client just waits for the response.
+  if (!ensureDitheredInBuffer(name)) {
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"processing failed\"}");
     return;
   }
   server.send(200, "application/json", "{\"ok\":true}");
   epdDisplayCurrentBuffer();   // slow refresh; client already acknowledged
 }
 
-// Upload: stream the original straight into /originals. Dithering happens later
-// in the background queue (processNextPending in the main sketch).
+// Upload: stream the original straight into /originals. Dithering happens
+// lazily the first time the photo is displayed (ensureDitheredInBuffer).
 static void handleUpload() {
   HTTPUpload& up = server.upload();
   if (up.status == UPLOAD_FILE_START) {
@@ -333,8 +335,6 @@ static void handleUpload() {
     if (uploadFile) {
       uploadFile.close();
       uploadStored = true;
-      workPending = true;          // tell the dither task there's work
-      lastUploadMs = millis();
     }
   }
 }
@@ -348,8 +348,9 @@ static void handleUploadDone() {
               "{\"ok\":true,\"name\":\"" + jsonEscape(uploadFinalName) + "\"}");
 }
 
-// Delete every dithered buffer; the background queue rebuilds them from the
-// originals. Use after changing the dither pipeline or to recover corrupt .bins.
+// Clear the dither cache: delete every cached buffer. Each photo is rebuilt
+// lazily from its original the next time it is displayed. Use after changing
+// the dither pipeline or to recover corrupt .bins.
 static void handleRedither() {
   int removed = 0;
   while (true) {
@@ -372,7 +373,6 @@ static void handleRedither() {
   }
 
   clearAllFailed();
-  workPending = true;                    // let the dither task rebuild from /originals
   server.send(200, "application/json", "{\"ok\":true,\"removed\":" + String(removed) + "}");
 }
 

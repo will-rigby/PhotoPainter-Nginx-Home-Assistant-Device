@@ -4,9 +4,13 @@
 // Image Processing: JPEG/BMP decode → resize → dither
 // --------------------------------------------------
 //
-// Requires the JPEGDEC library by Larry Bank.
-// Install via Arduino Library Manager.
+// Requires the JPEGDEC fork with improved progressive JPEG support
+// (Progressive-JPEG branch of https://github.com/will-rigby/JPEGDEC),
+// junctioned/copied into the Arduino sketchbook libraries folder — NOT the
+// Library Manager version. See README "Required Libraries".
 //
+
+#include <esp_heap_caps.h>
 
 // --------------------------------------------------
 // 6-colour palette (approximate RGB values for ACeP panel)
@@ -39,6 +43,19 @@ static int        jpgDecodeH    = 0;         // buffer height
 static int        jpgFillW      = 0;         // actual width JPEGDEC filled
 static int        jpgFillH      = 0;         // actual height JPEGDEC filled
 static File       jpgFile;                   // kept open during decode
+
+// Progressive-JPEG coefficient buffer hooks: the fork allocates its multi-scan
+// coefficient store (~3 B/px full-res for 4:2:0, 6 B/px for 4:4:4) through
+// these. Must live in PSRAM; if the alloc fails (image too large) the library
+// gracefully falls back to a 1/8 DC-only thumbnail decode.
+static void* jpgCoefAlloc(uint32_t size) {
+  Serial.printf("JPEGDEC coeff buffer request: %u bytes (PSRAM)\n", (unsigned)size);
+  return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
+static void jpgCoefFree(void* p) {
+  heap_caps_free(p);
+}
 
 // --------------------------------------------------
 // JPEGDEC file-I/O callbacks (SD card)
@@ -103,6 +120,9 @@ static bool decodeJPEG(const char* path) {
     return false;
   }
 
+  // Must be set after open() — open() resets the decoder state.
+  jpeg.setBufferHooks(jpgCoefAlloc, jpgCoefFree);
+
   int origW = jpeg.getWidth();
   int origH = jpeg.getHeight();
   Serial.printf("JPEG %dx%d\n", origW, origH);
@@ -144,6 +164,7 @@ static bool decodeJPEG(const char* path) {
 
   jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
   rc = jpeg.decode(0, 0, scales[best].flag);
+  int decodeMode = jpeg.getDecodeMode();   // read before close()
   jpeg.close();
 
   if (!rc) {
@@ -151,6 +172,16 @@ static bool decodeJPEG(const char* path) {
     free(jpgDecodeBuf);
     jpgDecodeBuf = nullptr;
     return false;
+  }
+
+  if (decodeMode == JPEG_DECODE_PROGRESSIVE_FULL) {
+    Serial.println("Progressive JPEG: full multi-scan decode");
+  } else if (decodeMode == JPEG_DECODE_PROGRESSIVE_THUMBNAIL) {
+    // The library forces 1/8 scale in this mode; the smaller filled region is
+    // handled by the jpgFillW/H tracking and upscaled by resizeToDisplay().
+    Serial.println("WARN: progressive JPEG fell back to 1/8 DC-only thumbnail "
+                   "(coefficient alloc failed or unsupported subsampling) — "
+                   "output will be soft");
   }
 
   Serial.printf("JPEG decoded OK — filled %dx%d of %dx%d buffer\n",
@@ -348,7 +379,7 @@ static int nearestPaletteColor(int r, int g, int b) {
 // Floyd–Steinberg dither (RGB888 → 6-colour EPD buffer)
 // --------------------------------------------------
 
-static void floydSteinbergDither(uint8_t* dst, uint8_t* rgb, int w, int h) {
+static bool floydSteinbergDither(uint8_t* dst, uint8_t* rgb, int w, int h) {
   Serial.println("Floyd-Steinberg dithering...");
 
   // Two rows of signed error accumulators (R, G, B per pixel)
@@ -357,7 +388,7 @@ static void floydSteinbergDither(uint8_t* dst, uint8_t* rgb, int w, int h) {
   if (!errCur || !errNext) {
     Serial.println("Dither error-buffer alloc failed");
     free(errCur); free(errNext);
-    return;
+    return false;
   }
 
   // Seed first row
@@ -431,6 +462,7 @@ static void floydSteinbergDither(uint8_t* dst, uint8_t* rgb, int w, int h) {
   free(errCur);
   free(errNext);
   Serial.println("Dithering complete");
+  return true;
 }
 
 // --------------------------------------------------
@@ -473,9 +505,10 @@ bool imgRenderToBuffer(uint8_t* target) {
 
   if (!resized) return false;
 
-  floydSteinbergDither(target, resized, EPD_WIDTH, EPD_HEIGHT);
+  bool ok = floydSteinbergDither(target, resized, EPD_WIDTH, EPD_HEIGHT);
 
   free(resized);
+  if (!ok) return false;
   Serial.println("Image rendering complete");
   return true;
 }

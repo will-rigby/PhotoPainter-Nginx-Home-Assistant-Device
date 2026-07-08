@@ -5,7 +5,7 @@ _YouTube Overview (covers the earlier nginx-based version)_
 
 Custom firmware for the [Waveshare ESP32-S3-PhotoPainter](https://www.waveshare.com/wiki/ESP32-S3-PhotoPainter), a battery-powered e-ink photo frame featuring an ESP32-S3 and a 7.3" Spectra ACeP 6-colour display (800×480). This project replaces the stock firmware with an Arduino-based sketch.
 
-The frame is **self-contained**: when plugged into USB-C power it runs a built-in **web server** where you browse a **gallery** of your original photos on the SD card and **upload** new ones (one or many at a time) from your phone or computer. The originals are kept on the card, and each is resized and Floyd–Steinberg dithered to the 6-colour panel format **in the background**. On battery the frame deep-sleeps, rotating through the dithered photos and reporting temperature, humidity, and battery voltage to Home Assistant via MQTT. **No external image server is required.**
+The frame is **self-contained**: when plugged into USB-C power it runs a built-in **web server** where you browse a **gallery** of your original photos on the SD card and **upload** new ones (one or many at a time) from your phone or computer. The originals are kept on the card; the first time a photo is displayed it is resized and Floyd–Steinberg dithered to the 6-colour panel format **on the fly**, and the result is cached on the SD card so every later display is a fast load. On battery the frame deep-sleeps, rotating through your photos and reporting temperature, humidity, and battery voltage to Home Assistant via MQTT. **No external image server is required.**
 
 > **Note:** This firmware is **not** based on the official Waveshare ESP-IDF demo. It is written from scratch using the Arduino framework. The stock firmware is not required, but an SD card **is** (it stores your photos).
 
@@ -23,7 +23,8 @@ By default (no saved network) the frame **hosts its own WPA2 access point** name
 ## Features
 
 - Built-in web server (USB-powered): photo **gallery** (shows originals), multi-file **upload**, **delete**, and "show now"
-- Originals kept on the SD card; each dithered to the 800×480 6-colour panel format (bilinear cover-crop + Floyd–Steinberg) in a **background queue** so uploads don't block
+- Originals kept on the SD card; each is dithered to the 800×480 6-colour panel format (bilinear cover-crop + Floyd–Steinberg) **lazily at display time**, then cached as a `.bin` so later displays skip the work
+- Full **progressive JPEG** decoding via a JPEGDEC fork that buffers the multi-scan coefficients in PSRAM (with automatic 1/8-thumbnail fallback for very large progressive files)
 - Self-hosting WPA2 access point with web-based WiFi configuration; STA with AP fallback
 - Web-based MQTT configuration (separate settings page)
 - Settings persisted to flash (NVS) — no recompiling to change WiFi/MQTT
@@ -62,8 +63,20 @@ The Arduino sketch lives in the [esp32_photo-frame/](esp32_photo-frame/) folder.
 Install the following via the Arduino Library Manager:
 
 - **XPowersLib** — AXP2101 PMU driver
-- **JPEGDEC** — JPEG decoder by Larry Bank
 - **PubSubClient** — MQTT client by Nick O'Leary
+
+**JPEGDEC** must be the fork with improved progressive JPEG support, **not** the Library Manager version (make sure the stock JPEGDEC is *not* also installed — two copies of the same library conflict). Clone the fork, switch to its `Progressive-JPEG` branch, and link it into your sketchbook libraries folder, e.g. on Windows:
+
+```powershell
+git clone https://github.com/will-rigby/JPEGDEC.git
+git -C JPEGDEC switch Progressive-JPEG
+
+New-Item -ItemType Junction `
+  -Path "$env:USERPROFILE\Documents\Arduino\libraries\JPEGDEC" `
+  -Target (Resolve-Path JPEGDEC)
+```
+
+The fork decodes progressive JPEGs in full by buffering the multi-scan DCT coefficients in PSRAM (~3 bytes/pixel of the full image for 4:2:0, 6 bytes/pixel for 4:4:4). If a progressive file is too large for the coefficient buffer, it automatically falls back to the old 1/8-scale DC-only thumbnail decode instead of failing.
 
 `WiFi`, `WebServer`, `DNSServer`, `Preferences`, `SD`, `SPI`, and `Wire` ship with the ESP32 Arduino core — nothing extra to install.
 
@@ -89,10 +102,11 @@ If you'd like a device to come up already knowing your WiFi/MQTT (so you can ski
 
 ### 5. Using the gallery
 
-- **Upload** — on the Gallery page, choose one or more `.jpg`/`.jpeg`/`.bmp` files (multi-select is supported) and upload. The originals are saved immediately and each is dithered to the panel format in the background; cards show *processing* until *ready*.
-- **Gallery** — shows the original photos. Each shows a status badge (*processing* / *ready* / *failed*).
-- **Show** — display a *ready* photo on the panel immediately (~30s refresh).
-- **Delete** — removes both the original and its dithered buffer from the SD card.
+- **Upload** — on the Gallery page, choose one or more `.jpg`/`.jpeg`/`.bmp` files (multi-select is supported) and upload. The originals are saved immediately; nothing is processed until a photo is first displayed.
+- **Gallery** — shows the original photos. Each shows a cache badge (*cached* / *not cached* / *failed*).
+- **Show** — display any photo on the panel immediately. Uncached photos take a few extra seconds to decode + dither first; the ~30s panel refresh follows either way.
+- **Clear dither cache** — deletes all cached `.bin` buffers; each is rebuilt automatically the next time its photo is displayed (use after tweaking the dither pipeline).
+- **Delete** — removes both the original and its cached buffer from the SD card.
 
 ### 6. MQTT / Home Assistant
 
@@ -129,7 +143,7 @@ No manual MQTT entity configuration is needed — just ensure the HA MQTT integr
 
 | File                    | Description                                                        |
 |-------------------------|--------------------------------------------------------------------|
-| `esp32_photo-frame.ino` | Main sketch — power-mode selection, setup/loop, display rotation, background dithering queue |
+| `esp32_photo-frame.ino` | Main sketch — power-mode selection, setup/loop, display rotation, lazy render + dither cache |
 | `spectra73.ino`         | Spectra 7.3" ACeP e-ink panel driver + framebuffer ⇄ SD `.bin` I/O |
 | `image_processing.ino`  | JPEG/BMP decode, bilinear resize, Floyd–Steinberg dither           |
 | `network.ino`           | WiFi station connect + WPA2 access-point fallback                  |
@@ -142,20 +156,19 @@ No manual MQTT entity configuration is needed — just ensure the HA MQTT integr
 
 ## Storage layout (SD card)
 
-- `/originals/<base>.<ext>` — the original uploaded photos (`.jpg`/`.jpeg`/`.bmp`). **This is what the gallery displays.**
-- `/dithered/<base>.bin` — pre-processed 800×480 4bpp panel buffers (192,000 bytes each), paired with each original by base name. **This is the source for display rotation.**
+- `/originals/<base>.<ext>` — the original uploaded photos (`.jpg`/`.jpeg`/`.bmp`). **This is what the gallery displays and what display rotation picks from.**
+- `/dithered/<base>.bin` — lazily built display cache: 800×480 4bpp panel buffers (192,000 bytes each), paired with each original by base name. Each is created the first time its photo is displayed and reused after.
 
-A photo shows as *processing* in the gallery until its `/dithered/<base>.bin` exists, then *ready*.
+A photo shows as *not cached* in the gallery until its `/dithered/<base>.bin` exists, then *cached*.
 
-## Image pipeline (upload → background dithering)
+## Image pipeline (lazy render at display time)
 
-1. The browser uploads one or more JPEG/BMP files to `/upload`; each is streamed straight into `/originals` and the request returns immediately (no blocking).
-2. A **background queue** (`processNextPending()` in [esp32_photo-frame.ino](esp32_photo-frame/esp32_photo-frame.ino)) drains in `loop()`, one image at a time, so uploads return immediately and processing proceeds while the gallery updates. Non-image files on the card are ignored.
-3. For each pending original, `processImage()` in [image_processing.ino](esp32_photo-frame/image_processing.ino) decodes it, picks the most aggressive downscale that still covers 800×480, and bilinear-resizes (cover + centred crop) into an RGB888 buffer in PSRAM.
-4. The Floyd–Steinberg stage converts the RGB data into the 6-colour ACeP palette directly in the panel framebuffer, which is then written to `/dithered/<base>.bin` (`epdSaveBufferToFile`).
-5. At display time the frame just loads a `.bin` back into the framebuffer (`epdLoadBufferFromFile`) and refreshes the panel — no decoding needed, which keeps battery refreshes fast and cheap.
+1. The browser uploads one or more JPEG/BMP files to `/upload`; each is streamed straight into `/originals` and the request returns immediately — nothing is processed at upload time.
+2. When a photo is displayed (rotation timer, button, or the web UI's **Show**), `ensureDitheredInBuffer()` in [esp32_photo-frame.ino](esp32_photo-frame/esp32_photo-frame.ino) checks for its cached `/dithered/<base>.bin`. On a **cache hit** it just loads the buffer (`epdLoadBufferFromFile`) and refreshes the panel — no decoding, which keeps battery refreshes fast and cheap. A corrupt/short `.bin` is deleted and re-rendered automatically.
+3. On a **cache miss**, `imgDecode()` in [image_processing.ino](esp32_photo-frame/image_processing.ino) decodes the original (JPEGDEC picks the most aggressive downscale that still covers 800×480; progressive JPEGs get a PSRAM-backed full multi-scan decode), then bilinear-resizes (cover + centred crop) into an RGB888 buffer in PSRAM.
+4. The Floyd–Steinberg stage converts the RGB data into the 6-colour ACeP palette directly in the panel framebuffer, which is saved to `/dithered/<base>.bin` (`epdSaveBufferToFile`) before the panel refreshes — so the work is done once per photo, not once per display.
 
-Deleting a photo removes both its original and its dithered buffer. A file that fails to decode is marked *failed* and skipped (not retried in a loop).
+Deleting a photo removes both its original and its cached buffer. A file that fails to decode is marked *failed* and skipped (not retried in a loop); display rotation picks another photo instead.
 
 ## Power / mode behaviour
 
@@ -170,7 +183,7 @@ This project uses the following third-party libraries. Full license texts are av
 
 | Library | Author | License | Repository |
 |---------|--------|---------|------------|
-| [JPEGDEC](https://github.com/bitbank2/JPEGDEC) | Larry Bank / BitBank Software, Inc. | Apache-2.0 | [bitbank2/JPEGDEC](https://github.com/bitbank2/JPEGDEC) |
+| [JPEGDEC](https://github.com/bitbank2/JPEGDEC) | Larry Bank / BitBank Software, Inc. | Apache-2.0 | [bitbank2/JPEGDEC](https://github.com/bitbank2/JPEGDEC) (used via the [will-rigby fork](https://github.com/will-rigby/JPEGDEC), `Progressive-JPEG` branch) |
 | [XPowersLib](https://github.com/lewisxhe/XPowersLib) | Lewis He / LilyGO | MIT | [lewisxhe/XPowersLib](https://github.com/lewisxhe/XPowersLib) |
 | [PubSubClient](https://github.com/knolleary/pubsubclient) | Nick O'Leary | MIT | [knolleary/pubsubclient](https://github.com/knolleary/pubsubclient) |
 

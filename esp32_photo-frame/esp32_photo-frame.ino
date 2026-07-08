@@ -66,8 +66,6 @@
 #define SENSOR_INTERVAL_MS  (5UL * 60UL * 1000UL)             // 5 minutes
 #define ROTATE_INTERVAL_MS  ((uint32_t)ROTATE_MINUTES * 60UL * 1000UL)
 #define POWER_CHECK_MS      10000UL                           // re-check USB every 10s
-#define WORK_QUIET_MS       1500UL                            // don't process within this of an upload
-#define WORK_GAP_MS         100UL                             // min gap between processing two images
 #define MAX_FAILED          32                                // session failed-set size
 
 // --------------------------------------------------
@@ -92,16 +90,11 @@ PubSubClient  mqtt(mqttWifi);
 static uint32_t lastSensor     = 0;
 static uint32_t lastRotate     = 0;
 static uint32_t lastPowerCheck = 0;
-static uint32_t lastWork       = 0;
 
-// Background dithering queue state. workPending and lastUploadMs are also set
-// from the web upload handler in webserver.ino. The queue is drained one image
-// at a time in loop() (server mode).
-bool       workPending  = false;
-uint32_t   lastUploadMs = 0;
+// Session-only set of originals that failed to decode/render, so the display
+// paths skip them instead of retrying in a tight loop.
 static String   failedBases[MAX_FAILED];
 static int      failedCount = 0;
-static uint8_t* ditherBuf   = nullptr;   // scratch panel buffer for dithering
 
 // --------------------------------------------------
 // PMU
@@ -134,79 +127,16 @@ bool pmuVbusPresent() {
 }
 
 // --------------------------------------------------
-// Display a random pre-processed photo from the SD card
-// --------------------------------------------------
-
-static bool isBinFile(File& e) {
-  if (e.isDirectory()) return false;
-  String low = String(e.name());
-  low.toLowerCase();
-  return low.endsWith(".bin");
-}
-
-bool displayRandomFromSD() {
-  // Pass 1: count the .bin photos.
-  File dir = SD.open(DITHERED_DIR);
-  if (!dir) {
-    Serial.println("No /dithered directory on SD card");
-    return false;
-  }
-  int count = 0;
-  File e;
-  while ((e = dir.openNextFile())) {
-    if (isBinFile(e)) count++;
-    e.close();
-  }
-  dir.close();
-
-  if (count == 0) {
-    Serial.println("No photos on SD card yet");
-    return false;
-  }
-
-  int target = esp_random() % count;
-
-  // Pass 2: walk to the target-th .bin and resolve its path.
-  dir = SD.open(DITHERED_DIR);
-  String chosen;
-  int i = 0;
-  while ((e = dir.openNextFile())) {
-    if (isBinFile(e)) {
-      if (i == target) {
-        String nm = String(e.name());
-        int s = nm.lastIndexOf('/');
-        if (s >= 0) nm = nm.substring(s + 1);
-        chosen = String(DITHERED_DIR "/") + nm;
-        e.close();
-        break;
-      }
-      i++;
-    }
-    e.close();
-  }
-  dir.close();
-
-  if (chosen.length() == 0 || !epdLoadBufferFromFile(chosen.c_str())) {
-    Serial.println("Failed to load photo buffer");
-    return false;
-  }
-  Serial.printf("Displaying [%d/%d]: %s\n", target, count, chosen.c_str());
-
-  epdDisplayCurrentBuffer();
-  return true;
-}
-
-// --------------------------------------------------
-// Background dithering queue (drained in loop(), server mode)
+// Lazy dither cache (rendered at display time)
 // --------------------------------------------------
 //
-// Uploads drop originals into /originals and set workPending. loop() drains the
-// queue one image at a time: find an original with no matching .bin, decode,
-// resize + dither into ditherBuf, and save it. Processing one image briefly
-// blocks the web server (~seconds); the next image is handled on a later loop
-// pass. Failures are parked in a session-only set so they aren't retried in a
-// tight loop. The decode/resize/dither loops yield periodically (vTaskDelay) so
-// long jobs don't starve the idle task / trip the watchdog.
+// Originals live in /originals. Nothing is processed at upload time; instead,
+// the first time a photo is displayed it is decoded, resized + dithered
+// straight into the panel framebuffer (epdBuffer) and the result is saved as
+// /dithered/<base>.bin. Later displays of the same photo are a pure cache
+// load. Failures are parked in a session-only set so a bad file isn't retried
+// in a tight loop. The decode/resize/dither loops yield periodically
+// (vTaskDelay) so long jobs don't starve the idle task / trip the watchdog.
 // --------------------------------------------------
 
 bool isFailedBase(const String& base) {
@@ -250,47 +180,113 @@ static String baseOf(const String& filename) {
   return b;
 }
 
-// Process at most one pending original. Returns true if it did work (so the
-// caller keeps draining), false when nothing is pending.
-bool processNextPending() {
-  if (!ditherBuf) return false;
+// Ensure /dithered/<base>.bin exists for the given original (basename with
+// extension) and leave the image in epdBuffer, ready for
+// epdDisplayCurrentBuffer(). Cache hit: load the .bin (a corrupt/short .bin is
+// deleted and re-rendered). Miss: decode /originals/<name>, resize + dither
+// straight into epdBuffer, then save it as the cache file. A failed cache
+// *write* still returns true (the render is displayable; caching retries next
+// time); a failed decode or render marks the base failed and returns false.
+bool ensureDitheredInBuffer(const String& origName) {
+  if (!epdBuffer) return false;
 
-  File dir = SD.open(ORIGINALS_DIR);
-  if (!dir) return false;
-
-  String srcPath, base;
-  File e;
-  while ((e = dir.openNextFile())) {
-    if (!e.isDirectory()) {
-      String nm = String(e.name());
-      int s = nm.lastIndexOf('/');
-      if (s >= 0) nm = nm.substring(s + 1);
-      String b = baseOf(nm);
-      if (hasImageExt(nm) &&
-          !SD.exists(String(DITHERED_DIR "/") + b + ".bin") &&
-          !isFailedBase(b)) {
-        srcPath = String(ORIGINALS_DIR "/") + nm;
-        base = b;
-        e.close();
-        break;
-      }
-    }
-    e.close();
-  }
-  dir.close();
-
-  if (srcPath.length() == 0) return false;  // nothing pending
-
+  String base    = baseOf(origName);
   String binPath = String(DITHERED_DIR "/") + base + ".bin";
-  Serial.printf("Dithering: %s -> %s\n", srcPath.c_str(), binPath.c_str());
 
-  if (!imgDecode(srcPath.c_str()) ||
-      !imgRenderToBuffer(ditherBuf) ||
-      !epdSaveBufferToFile(binPath.c_str(), ditherBuf)) {
+  if (SD.exists(binPath)) {
+    if (epdLoadBufferFromFile(binPath.c_str())) return true;
+    Serial.printf("Corrupt cache %s — re-rendering\n", binPath.c_str());
+    SD.remove(binPath);
+  }
+
+  String srcPath = String(ORIGINALS_DIR "/") + origName;
+  Serial.printf("Rendering (lazy): %s -> %s\n", srcPath.c_str(), binPath.c_str());
+
+  if (!imgDecode(srcPath.c_str()) || !imgRenderToBuffer(epdBuffer)) {
     Serial.printf("Processing failed for %s (parked)\n", srcPath.c_str());
     markFailedBase(base);
+    return false;
   }
-  return true;  // advanced the queue either way
+
+  // Battery mode never runs the web server's ensureDirs().
+  if (!SD.exists(DITHERED_DIR)) SD.mkdir(DITHERED_DIR);
+
+  if (!epdSaveBufferToFile(binPath.c_str(), epdBuffer)) {
+    Serial.println("WARN: cache write failed (will retry next display)");
+  }
+
+  clearFailedBase(base);  // an explicit retry (e.g. /show) can un-park a base
+  return true;
+}
+
+// --------------------------------------------------
+// Display a random photo from /originals (lazy render + cache)
+// --------------------------------------------------
+
+bool displayRandomFromSD() {
+  const int MAX_ATTEMPTS = 4;
+
+  for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    // Pass 1: count displayable originals (decodable extension, not parked).
+    File dir = SD.open(ORIGINALS_DIR);
+    if (!dir) {
+      Serial.println("No /originals directory on SD card");
+      return false;
+    }
+    int count = 0;
+    File e;
+    while ((e = dir.openNextFile())) {
+      if (!e.isDirectory()) {
+        String nm = String(e.name());
+        int s = nm.lastIndexOf('/');
+        if (s >= 0) nm = nm.substring(s + 1);
+        if (hasImageExt(nm) && !isFailedBase(baseOf(nm))) count++;
+      }
+      e.close();
+    }
+    dir.close();
+
+    if (count == 0) {
+      Serial.println("No displayable photos on SD card");
+      return false;
+    }
+
+    int target = esp_random() % count;
+
+    // Pass 2: walk to the target-th displayable original.
+    dir = SD.open(ORIGINALS_DIR);
+    String chosen;
+    int i = 0;
+    while ((e = dir.openNextFile())) {
+      if (!e.isDirectory()) {
+        String nm = String(e.name());
+        int s = nm.lastIndexOf('/');
+        if (s >= 0) nm = nm.substring(s + 1);
+        if (hasImageExt(nm) && !isFailedBase(baseOf(nm))) {
+          if (i == target) {
+            chosen = nm;
+            e.close();
+            break;
+          }
+          i++;
+        }
+      }
+      e.close();
+    }
+    dir.close();
+
+    if (chosen.length() == 0) return false;  // card changed under us
+
+    // A failed render parks the base, so the next attempt's scan excludes it.
+    if (ensureDitheredInBuffer(chosen)) {
+      Serial.printf("Displaying [%d/%d]: %s\n", target, count, chosen.c_str());
+      epdDisplayCurrentBuffer();
+      return true;
+    }
+  }
+
+  Serial.println("Failed to display a photo (all attempts failed)");
+  return false;
 }
 
 // --------------------------------------------------
@@ -392,15 +388,8 @@ void setup() {
     wifiBringUp();        // STA if saved network reachable, else host AP
     webServerBegin();
 
-    // Scratch buffer the background dithering renders into (kept allocated).
-    ditherBuf = (uint8_t*)ps_malloc(EPD_BUF_SIZE);
-    if (!ditherBuf) ditherBuf = (uint8_t*)malloc(EPD_BUF_SIZE);
-    if (!ditherBuf) Serial.println("WARN: dither buffer alloc failed");
-
-    // Dither any originals left unprocessed (e.g. power lost mid-batch).
-    workPending = true;
-
-    // Show a photo immediately so the panel isn't blank.
+    // Show a photo immediately so the panel isn't blank. May decode+dither
+    // for a few seconds first if the random pick isn't cached yet.
     displayRandomFromSD();
 
     // Initial sensor report (no-op in AP mode or if MQTT unconfigured).
@@ -410,7 +399,6 @@ void setup() {
     lastSensor = now;
     lastRotate = now;
     lastPowerCheck = now;
-    lastWork = now;
     return;  // fall through to loop()
   }
 
@@ -478,15 +466,6 @@ void loop() {
     }
   }
   btnPrev = btnNow;
-
-  // Drain the dithering queue one image at a time, but only when the device is
-  // idle (no upload in the last WORK_QUIET_MS) so active uploads stay snappy.
-  if (workPending &&
-      (now - lastUploadMs >= WORK_QUIET_MS) &&
-      (now - lastWork >= WORK_GAP_MS)) {
-    if (!processNextPending()) workPending = false;
-    lastWork = millis();  // account for the processing time just spent
-  }
 
   if (now - lastSensor >= SENSOR_INTERVAL_MS) {
     lastSensor = now;
