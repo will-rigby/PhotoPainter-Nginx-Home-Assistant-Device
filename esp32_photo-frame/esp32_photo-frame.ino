@@ -127,6 +127,52 @@ bool pmuVbusPresent() {
 }
 
 // --------------------------------------------------
+// Low-battery indicator
+// --------------------------------------------------
+//
+// Overlaid on the framebuffer at refresh time (epdDisplayCurrentBuffer),
+// after the dither cache and thumbnail are generated from the buffer — so
+// cached .bins and thumbs stay clean and the icon disappears on the first
+// refresh after charging.
+
+#define LOW_BATT_ICON_PERCENT  20     // show icon at/below this charge level
+#define LOW_BATT_ICON_VOLTS    3.45f  // fallback when the fuel gauge is n/a
+
+static bool batteryIsLow() {
+  if (!pmuReady) return false;
+  if (pmu.isVbusIn() || pmu.isCharging()) return false;  // externally powered
+  int pct = pmu.getBatteryPercent();
+  if (pct >= 0) return pct <= LOW_BATT_ICON_PERCENT;
+  float vbat = pmu.getBattVoltage();
+  if (vbat > 100.0f) vbat /= 1000.0f;
+  return vbat > 0.1f && vbat < LOW_BATT_ICON_VOLTS;     // 0V = no battery
+}
+
+static void fillRectFb(int x, int y, int w, int h, uint8_t color) {
+  for (int yy = y; yy < y + h; yy++)
+    for (int xx = x; xx < x + w; xx++)
+      epdSetPixel(xx, yy, color);
+}
+
+// Small red nearly-empty battery, bottom-right, on a white pad for contrast.
+void overlayLowBatteryIcon() {
+  if (!batteryIsLow()) return;
+  Serial.println("Battery low - drawing indicator");
+
+  const int W = 48, H = 24, T = 3;   // body size, border thickness
+  const int x = EPD_WIDTH - W - 20;  // leaves room for the terminal nub
+  const int y = EPD_HEIGHT - H - 16;
+
+  fillRectFb(x - 4, y - 4, W + 12, H + 8, EPD_WHITE);          // backdrop
+  fillRectFb(x, y, W, T, EPD_RED);                             // top edge
+  fillRectFb(x, y + H - T, W, T, EPD_RED);                     // bottom edge
+  fillRectFb(x, y, T, H, EPD_RED);                             // left edge
+  fillRectFb(x + W - T, y, T, H, EPD_RED);                     // right edge
+  fillRectFb(x + W, y + 7, 4, H - 14, EPD_RED);                // terminal nub
+  fillRectFb(x + T + 2, y + T + 2, 6, H - 2 * T - 4, EPD_RED); // last sliver
+}
+
+// --------------------------------------------------
 // Lazy dither cache (rendered at display time)
 // --------------------------------------------------
 //
@@ -194,7 +240,10 @@ bool ensureDitheredInBuffer(const String& origName) {
   String binPath = String(DITHERED_DIR "/") + base + ".bin";
 
   if (SD.exists(binPath)) {
-    if (epdLoadBufferFromFile(binPath.c_str())) return true;
+    if (epdLoadBufferFromFile(binPath.c_str())) {
+      thumbEnsureFromBuffer(base);   // backfill a gallery thumb for old photos
+      return true;
+    }
     Serial.printf("Corrupt cache %s — re-rendering\n", binPath.c_str());
     SD.remove(binPath);
   }
@@ -216,6 +265,7 @@ bool ensureDitheredInBuffer(const String& origName) {
   }
 
   clearFailedBase(base);  // an explicit retry (e.g. /show) can un-park a base
+  thumbEnsureFromBuffer(base);
   return true;
 }
 

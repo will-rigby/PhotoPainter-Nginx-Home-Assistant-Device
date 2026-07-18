@@ -391,6 +391,7 @@ bool epdLoadBufferFromFile(const char* path) {
 // Push the current framebuffer to the panel and put it back to sleep.
 // Safe to call repeatedly (epdPortInit performs a full hardware reset).
 void epdDisplayCurrentBuffer() {
+  overlayLowBatteryIcon();   // no-op unless the battery is actually low
   epdPortInit();
   epdWriteBuffer();
   epdTurnOnDisplay();

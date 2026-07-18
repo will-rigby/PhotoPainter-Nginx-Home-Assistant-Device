@@ -34,6 +34,10 @@ static File   uploadFile;
 static String uploadFinalName;   // basename stored under /originals
 static bool   uploadStored;
 
+// Thumbnail upload state (browser sends one after each photo upload)
+static File   thumbFile;
+static bool   thumbStored;
+
 // --------------------------------------------------
 // Small helpers
 // --------------------------------------------------
@@ -41,6 +45,7 @@ static bool   uploadStored;
 static void ensureDirs() {
   if (!SD.exists(ORIGINALS_DIR)) SD.mkdir(ORIGINALS_DIR);
   if (!SD.exists(DITHERED_DIR))  SD.mkdir(DITHERED_DIR);
+  if (!SD.exists(THUMBS_DIR))    SD.mkdir(THUMBS_DIR);
 }
 
 static String baseNameOf(const String& p) {
@@ -105,6 +110,13 @@ static String jsonEscape(const String& s) {
 // Embedded pages (PROGMEM)
 // --------------------------------------------------
 
+// The gallery's upload JS re-encodes each image in the browser before
+// sending: cover + centred crop onto an 800x480 canvas (keep the literals in
+// prep() in sync with EPD_WIDTH/EPD_HEIGHT), exported via toBlob() which is
+// always baseline JPEG — so progressive originals never reach the device and
+// uploads shrink to ~100 KB. If decoding fails, the raw file is sent as-is.
+// After each upload it also POSTs a 400x240 JPEG to /thumb; the gallery grid
+// loads /thumb per photo and falls back to /original if none exists yet.
 static const char PAGE_INDEX[] PROGMEM =
   "<!doctype html><html><head><meta charset=utf-8><meta name=viewport "
   "content='width=device-width,initial-scale=1'><title>Photo Frame</title>"
@@ -134,7 +146,8 @@ static const char PAGE_INDEX[] PROGMEM =
   "if(!a.length){g.innerHTML='<p>No photos yet. Upload some above.</p>';}"
   "for(const p of a){const n=p.name;const d=document.createElement('div');d.className='card';"
   "let badge=p.cached?\"<span class=ok>cached</span>\":(p.failed?\"<span class=bad>failed</span>\":\"<span class=proc>not cached</span>\");"
-  "d.innerHTML=\"<img loading=lazy src='/original?file=\"+encodeURIComponent(n)+\"'>\"+"
+  "const u=encodeURIComponent(n);"
+  "d.innerHTML=\"<img loading=lazy src='/thumb?file=\"+u+\"' onerror=\\\"this.onerror=null;this.src='/original?file=\"+u+\"'\\\">\"+"
   "\"<div class=name>\"+n+\" \"+badge+\"</div><div class=btns>\"+"
   "\"<button onclick=\\\"show('\"+n+\"')\\\">Show</button>\"+"
   "\"<button class=del onclick=\\\"del('\"+n+\"')\\\">Delete</button></div>\";"
@@ -150,10 +163,32 @@ static const char PAGE_INDEX[] PROGMEM =
   "await fetch('/redither',{method:'POST'});s.textContent='Cache cleared.';load();}"
   "async function testpat(){await fetch('/test',{method:'POST'});"
   "alert('Drawing colour bars \\u2014 the panel should fill top-to-bottom with 6 stripes (~30s).');}"
+  "async function prep(f){try{"
+  "const bm=await createImageBitmap(f,{imageOrientation:'from-image'});"
+  "const c=document.createElement('canvas');c.width=800;c.height=480;"
+  "const k=Math.max(800/bm.width,480/bm.height);const sw=800/k,sh=480/k;"
+  "c.getContext('2d').drawImage(bm,(bm.width-sw)/2,(bm.height-sh)/2,sw,sh,0,0,800,480);bm.close();"
+  "const b=await new Promise(r=>c.toBlob(r,'image/jpeg',0.9));if(!b)return f;"
+  "return new File([b],f.name.replace(/\\.[^.]*$/,'')+'.jpg',{type:'image/jpeg'});"
+  "}catch(err){return f;}}"
+  "async function mkthumb(f){try{"
+  "const bm=await createImageBitmap(f);"
+  "const c=document.createElement('canvas');c.width=400;c.height=240;"
+  "const k=Math.max(400/bm.width,240/bm.height);const sw=400/k,sh=240/k;"
+  "c.getContext('2d').drawImage(bm,(bm.width-sw)/2,(bm.height-sh)/2,sw,sh,0,0,400,240);bm.close();"
+  "return await new Promise(r=>c.toBlob(r,'image/jpeg',0.8));"
+  "}catch(err){return null;}}"
   "async function up(e){e.preventDefault();const fs=document.getElementById('file').files;"
   "if(!fs.length)return false;const s=document.getElementById('status');"
-  "for(let i=0;i<fs.length;i++){s.textContent='Uploading '+(i+1)+'/'+fs.length+'\\u2026';"
-  "const fd=new FormData();fd.append('file',fs[i]);try{await fetch('/upload',{method:'POST',body:fd});}catch(err){}}"
+  "for(let i=0;i<fs.length;i++){s.textContent='Converting '+(i+1)+'/'+fs.length+'\\u2026';"
+  "const f=await prep(fs[i]);"
+  "s.textContent='Uploading '+(i+1)+'/'+fs.length+'\\u2026';"
+  "const fd=new FormData();fd.append('file',f);"
+  "try{const r=await fetch('/upload',{method:'POST',body:fd});const j=await r.json();"
+  "if(j.ok&&j.name){const tb=await mkthumb(f);"
+  "if(tb){const td=new FormData();td.append('file',tb,'t.jpg');"
+  "await fetch('/thumb?name='+encodeURIComponent(j.name),{method:'POST',body:td});}}"
+  "}catch(err){}}"
   "s.textContent='Uploaded '+fs.length+' file(s).';"
   "document.getElementById('file').value='';load();return false;}"
   "window.onload=load;</script></body></html>";
@@ -266,13 +301,78 @@ static void handleApiConfig() {
   server.send(200, "application/json", j);
 }
 
+// A photo's content never changes under a given name (uploads de-duplicate
+// names, thumbs are written once), so let the browser cache images for a week
+// instead of re-downloading the whole gallery on every visit.
+static const char CACHE_WEEK[] = "max-age=604800";
+
+// streamFile() reads the SD card ~1.4 KB at a time; reading in much larger
+// chunks roughly doubles throughput. Buffer lives in internal RAM (the
+// SD-over-SPI driver's DMA can't touch PSRAM).
+static void streamFileFast(File& f, const String& type) {
+  static uint8_t chunk[16384];
+  server.setContentLength(f.size());
+  server.send(200, type.c_str(), "");
+  WiFiClient client = server.client();
+  int n;
+  while ((n = f.read(chunk, sizeof(chunk))) > 0) {
+    size_t off = 0;
+    while (off < (size_t)n) {
+      size_t w = client.write(chunk + off, n - off);
+      if (!w) return;   // client gone
+      off += w;
+    }
+  }
+}
+
 static void handleOriginal() {
   String name = safeName(server.arg("file"));
   if (!validImageName(name)) { server.send(400, "text/plain", "bad name"); return; }
   File f = SD.open(String(ORIGINALS_DIR "/") + name);
   if (!f) { server.send(404, "text/plain", "not found"); return; }
-  server.streamFile(f, contentTypeFor(name));
+  server.sendHeader("Cache-Control", CACHE_WEEK);
+  streamFileFast(f, contentTypeFor(name));
   f.close();
+}
+
+// Serve /thumbs/<base>.jpg (browser-uploaded) or .bmp (device-generated).
+// 404 makes the gallery <img> fall back to the full original.
+static void handleThumb() {
+  String name = safeName(server.arg("file"));
+  if (!validImageName(name)) { server.send(400, "text/plain", "bad name"); return; }
+  String base = baseNoExt(name);
+  String type = "image/jpeg";
+  File f = SD.open(String(THUMBS_DIR "/") + base + ".jpg");
+  if (!f) { f = SD.open(String(THUMBS_DIR "/") + base + ".bmp"); type = "image/bmp"; }
+  if (!f) { server.send(404, "text/plain", "no thumb"); return; }
+  server.sendHeader("Cache-Control", CACHE_WEEK);
+  streamFileFast(f, type);
+  f.close();
+}
+
+// Browser-generated JPEG thumbnail, sent right after a photo upload. The
+// original's final (de-duplicated) name arrives in the query string.
+static void handleThumbUpload() {
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    thumbStored = false;
+    String name = safeName(server.arg("name"));
+    if (!validImageName(name)) return;
+    ensureDirs();
+    thumbFile = SD.open((String(THUMBS_DIR "/") + baseNoExt(name) + ".jpg").c_str(), FILE_WRITE);
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (thumbFile) thumbFile.write(up.buf, up.currentSize);
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (thumbFile) {
+      thumbFile.close();
+      thumbStored = true;
+    }
+  }
+}
+
+static void handleThumbDone() {
+  server.send(thumbStored ? 200 : 400, "application/json",
+              thumbStored ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
 static void handleDelete() {
@@ -285,6 +385,10 @@ static void handleDelete() {
   bool removed = false;
   if (SD.exists(orig)) removed = SD.remove(orig);
   if (SD.exists(bin))  SD.remove(bin);
+  String tj = String(THUMBS_DIR "/") + base + ".jpg";
+  String tb = String(THUMBS_DIR "/") + base + ".bmp";
+  if (SD.exists(tj)) SD.remove(tj);
+  if (SD.exists(tb)) SD.remove(tb);
   clearFailedBase(base);
 
   server.send(removed ? 200 : 404, "application/json",
@@ -423,6 +527,8 @@ void webServerBegin() {
   server.on("/api/photos", HTTP_GET,  handleApiPhotos);
   server.on("/api/config", HTTP_GET,  handleApiConfig);
   server.on("/original",   HTTP_GET,  handleOriginal);
+  server.on("/thumb",      HTTP_GET,  handleThumb);
+  server.on("/thumb",      HTTP_POST, handleThumbDone, handleThumbUpload);
   server.on("/delete",     HTTP_POST, handleDelete);
   server.on("/show",       HTTP_POST, handleShow);
   server.on("/redither",   HTTP_POST, handleRedither);

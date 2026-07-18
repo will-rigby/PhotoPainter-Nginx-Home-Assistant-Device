@@ -11,9 +11,15 @@ bool sdInit() {
 
   sdSpi.begin(SD_PIN_CLK, SD_PIN_MISO, SD_PIN_MOSI, SD_PIN_CS);
 
-  if (!SD.begin(SD_PIN_CS, sdSpi, 4000000)) {
-    Serial.println("SD card init failed!");
-    return false;
+  // 20 MHz is ~5x faster than the conservative 4 MHz and works on the
+  // PhotoPainter's short traces; fall back if this particular card can't
+  // keep up.
+  if (!SD.begin(SD_PIN_CS, sdSpi, 20000000)) {
+    Serial.println("SD init at 20 MHz failed - retrying at 4 MHz");
+    if (!SD.begin(SD_PIN_CS, sdSpi, 4000000)) {
+      Serial.println("SD card init failed!");
+      return false;
+    }
   }
 
   uint8_t cardType = SD.cardType();

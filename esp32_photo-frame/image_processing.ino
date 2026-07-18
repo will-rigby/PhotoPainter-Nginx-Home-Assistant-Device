@@ -512,3 +512,66 @@ bool imgRenderToBuffer(uint8_t* target) {
   Serial.println("Image rendering complete");
   return true;
 }
+
+// --------------------------------------------------
+// Gallery thumbnail backfill (device side)
+// --------------------------------------------------
+//
+// New uploads get a JPEG thumbnail from the browser; photos that predate that
+// get one here the first time they are displayed. The dithered framebuffer is
+// box-averaged 4x4 back into smooth RGB (the dither noise averages out) and
+// written as an uncompressed 200x120 24bpp BMP (~72 KB) — no JPEG encoder
+// needed, and the thumbnail shows exactly what the panel shows.
+
+#define THUMB_W (EPD_WIDTH / 4)
+#define THUMB_H (EPD_HEIGHT / 4)
+
+static void bmpPutU32(uint8_t* p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
+static void bmpPutU16(uint8_t* p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
+
+void thumbEnsureFromBuffer(const String& base) {
+  if (!epdBuffer) return;
+  if (SD.exists(String(THUMBS_DIR "/") + base + ".jpg")) return;
+  String bp = String(THUMBS_DIR "/") + base + ".bmp";
+  if (SD.exists(bp)) return;
+  if (!SD.exists(THUMBS_DIR)) SD.mkdir(THUMBS_DIR);
+
+  // EPD colour code -> RGB (codes outside the palette render white)
+  uint8_t lut[16][3];
+  memset(lut, 255, sizeof(lut));
+  for (int i = 0; i < PALETTE_SIZE; i++)
+    memcpy(lut[paletteEPD[i]], paletteRGB[i], 3);
+
+  File f = SD.open(bp.c_str(), FILE_WRITE);
+  if (!f) { Serial.printf("Thumb write failed: %s\n", bp.c_str()); return; }
+
+  const uint32_t rowBytes = THUMB_W * 3;   // 600, already a multiple of 4
+  uint8_t hdr[54] = { 0 };
+  hdr[0] = 'B'; hdr[1] = 'M';
+  bmpPutU32(hdr + 2,  54 + rowBytes * THUMB_H);   // file size
+  bmpPutU32(hdr + 10, 54);                        // pixel data offset
+  bmpPutU32(hdr + 14, 40);                        // BITMAPINFOHEADER size
+  bmpPutU32(hdr + 18, THUMB_W);
+  bmpPutU32(hdr + 22, THUMB_H);                   // positive height = bottom-up
+  bmpPutU16(hdr + 26, 1);                         // planes
+  bmpPutU16(hdr + 28, 24);                        // bits per pixel
+  bmpPutU32(hdr + 34, rowBytes * THUMB_H);        // image size
+  f.write(hdr, sizeof(hdr));
+
+  uint8_t row[THUMB_W * 3];
+  for (int ty = THUMB_H - 1; ty >= 0; ty--) {     // BMP rows are bottom-up
+    uint8_t* o = row;
+    for (int tx = 0; tx < THUMB_W; tx++) {
+      uint16_t r = 0, g = 0, b = 0;
+      for (int dy = 0; dy < 4; dy++)
+        for (int dx = 0; dx < 4; dx++) {
+          const uint8_t* c = lut[epdGetPixel(tx * 4 + dx, ty * 4 + dy) & 0x0F];
+          r += c[0]; g += c[1]; b += c[2];
+        }
+      *o++ = b >> 4; *o++ = g >> 4; *o++ = r >> 4;   // BGR, /16
+    }
+    f.write(row, sizeof(row));
+  }
+  f.close();
+  Serial.printf("Thumbnail written: %s\n", bp.c_str());
+}
