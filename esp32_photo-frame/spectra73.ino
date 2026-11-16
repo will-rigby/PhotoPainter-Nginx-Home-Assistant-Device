@@ -16,14 +16,20 @@ uint8_t* epdBuffer = nullptr;
 // BUSY HANDLING
 // --------------------------------------------------
 
+static bool epdError = false;
+
 bool epdWaitBusy(uint32_t timeout_ms = 60000) {
+  if (epdError) return false;
   uint32_t start = millis();
 
   while (digitalRead(PIN_BUSY) == LOW) {
     if (millis() - start > timeout_ms) {
       Serial.println("EPD BUSY timeout!");
+      epdError = true;
+      displayFailure("Panel BUSY timeout");
       return false;
     }
+    controlMaintenance();
     delay(5);
   }
   return true;
@@ -44,6 +50,7 @@ bool epdSendCommand(uint8_t cmd) {
 }
 
 void epdSendData(uint8_t data) {
+  if (epdError) return;
   digitalWrite(PIN_DC, HIGH);
   digitalWrite(PIN_CS, LOW);
   spi.transfer(data);
@@ -214,8 +221,7 @@ void epdClear(uint8_t color) {
   memset(epdBuffer, packed, EPD_BUF_SIZE);
 }
 
-// Set a pixel in an arbitrary 4bpp panel buffer (lets the background dither
-// task write into its own buffer instead of the shared framebuffer).
+// Set a pixel in the caller-selected 4bpp panel buffer.
 void epdSetPixelBuf(uint8_t* buf, int x, int y, uint8_t color) {
   if (!buf) return;
   if (x < 0 || x >= EPD_WIDTH || y < 0 || y >= EPD_HEIGHT) return;
@@ -287,6 +293,7 @@ void epdFillRect(int x, int y, int w, int h, uint8_t color) {
 // --------------------------------------------------
 
 void epdWriteBuffer() {
+  if (epdError) return;
   if (!epdBuffer) {
     Serial.println("No framebuffer!");
     return;
@@ -327,8 +334,8 @@ static uint8_t sdIoBuf[4096];   // internal DRAM, DMA-safe bounce buffer
 bool epdSaveBufferToFile(const char* path, const uint8_t* buf) {
   if (!buf) return false;
 
-  if (SD.exists(path)) SD.remove(path);
-  File f = SD.open(path, FILE_WRITE);
+  if (storage.exists(path)) storage.remove(path);
+  StorageFile f = storage.open(path, FILE_WRITE);
   if (!f) {
     Serial.print("Failed to open for write: ");
     Serial.println(path);
@@ -348,7 +355,7 @@ bool epdSaveBufferToFile(const char* path, const uint8_t* buf) {
   if (!ok) {
     Serial.printf("Short write (%u/%u) to %s\n",
                   (unsigned)total, (unsigned)EPD_BUF_SIZE, path);
-    SD.remove(path);
+    storage.remove(path);
     return false;
   }
   return true;
@@ -357,7 +364,7 @@ bool epdSaveBufferToFile(const char* path, const uint8_t* buf) {
 bool epdLoadBufferFromFile(const char* path) {
   if (!epdBuffer) return false;
 
-  File f = SD.open(path);
+  StorageFile f = storage.open(path);
   if (!f) {
     Serial.print("Failed to open for read: ");
     Serial.println(path);
@@ -390,12 +397,15 @@ bool epdLoadBufferFromFile(const char* path) {
 
 // Push the current framebuffer to the panel and put it back to sleep.
 // Safe to call repeatedly (epdPortInit performs a full hardware reset).
-void epdDisplayCurrentBuffer() {
+bool epdDisplayCurrentBuffer() {
+  epdError = false;
+  if (!epdBuffer) return false;
   overlayLowBatteryIcon();   // no-op unless the battery is actually low
   epdPortInit();
   epdWriteBuffer();
   epdTurnOnDisplay();
   epdDeepSleep();
+  return !epdError;
 }
 
 // --------------------------------------------------

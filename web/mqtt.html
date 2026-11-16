@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MQTT · Photo Frame</title><link rel="stylesheet" href="/app.css"><script src="/app.js" defer></script></head>
+<body data-page="mqtt"><nav aria-label="Main"><a href="/">Gallery</a><a href="/wifi">WiFi</a><a href="/mqtt" aria-current="page">MQTT</a></nav><main class="settings"><h1>MQTT settings</h1>
+<p>Report sensors to Home Assistant. Leave the broker host blank to disable MQTT. Saved changes apply when the frame finishes its current work.</p>
+<form id="settings"><label for="host">Broker host / IP</label><input id="host" name="host" maxlength="253" autocapitalize="none" spellcheck="false">
+<label for="port">Port</label><input id="port" name="port" type="number" min="1" max="65535" step="1" value="1883" required>
+<label for="user">Username</label><input id="user" name="user" maxlength="128" autocomplete="username">
+<label for="password">New password</label><input id="password" name="pass" type="password" maxlength="256" placeholder="Leave blank to keep saved password" autocomplete="new-password">
+<label class="check"><input id="clear-password" name="clear_password" type="checkbox">Clear saved password</label><p id="password-state"></p>
+<button type="submit">Save settings</button></form><p id="notice" role="status" aria-live="polite"></p></main></body></html>

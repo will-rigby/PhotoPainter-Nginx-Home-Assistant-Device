@@ -1,548 +1,341 @@
 // SPDX-License-Identifier: 0BSD
-
-// --------------------------------------------------
-// Embedded HTTP server: photo gallery + upload + WiFi/MQTT settings
-// --------------------------------------------------
-//
-// Runs only on USB power ("server mode"). Serves:
-//   GET  /             gallery page (shows original photos)
-//   GET  /wifi         WiFi settings page
-//   GET  /mqtt         MQTT settings page
-//   GET  /api/photos   JSON list of originals with cached/failed status
-//   GET  /api/config   current (non-secret) config for prefilling forms
-//   GET  /original?file= stream an original image from /originals
-//   POST /upload       multipart upload -> store original in /originals
-//   POST /delete?file= remove a photo (original + cached buffer)
-//   POST /show?file=   render (if uncached) and display a photo now
-//   POST /api/wifi     save WiFi credentials
-//   POST /api/mqtt     save MQTT settings
-//
-// Photos are decoded + dithered lazily at display time (ensureDitheredInBuffer
-// in esp32_photo-frame.ino) and cached as /dithered/<base>.bin, so uploads just
-// store the original and return.
-//
-
 #include <WebServer.h>
 #include <DNSServer.h>
 #include "config.h"
+#include "policies.h"
+#include "web_assets.h"
 
 static WebServer server(80);
 static DNSServer dnsServer;
+static TaskHandle_t httpTask = nullptr;
+static SemaphoreHandle_t httpStopped = nullptr;
 
-// Upload state (one file per request)
-static File   uploadFile;
-static String uploadFinalName;   // basename stored under /originals
-static bool   uploadStored;
-
-// Thumbnail upload state (browser sends one after each photo upload)
-static File   thumbFile;
-static bool   thumbStored;
-
-// --------------------------------------------------
-// Small helpers
-// --------------------------------------------------
-
-static void ensureDirs() {
-  if (!SD.exists(ORIGINALS_DIR)) SD.mkdir(ORIGINALS_DIR);
-  if (!SD.exists(DITHERED_DIR))  SD.mkdir(DITHERED_DIR);
-  if (!SD.exists(THUMBS_DIR))    SD.mkdir(THUMBS_DIR);
+static void sendJson(int status, const String& body) {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(status, "application/json", body);
 }
-
-static String baseNameOf(const String& p) {
-  int s = p.lastIndexOf('/');
-  return (s >= 0) ? p.substring(s + 1) : p;
+static void sendError(int status, const String& message) {
+  if (status >= 500) operationError(message);
+  sendJson(status, "{\"ok\":false,\"error\":\"" + jsonEscape(message) + "\"}");
 }
-
-static String baseNoExt(const String& name) {
-  String b = baseNameOf(name);
-  int dot = b.lastIndexOf('.');
-  if (dot > 0) b = b.substring(0, dot);
-  return b;
+static bool storageAvailable() {
+  RuntimeSnapshot state = runtimeSnapshot();
+  if (!state.sdReady || state.stopping) { sendError(503, "Storage unavailable or device stopping"); return false; }
+  return true;
 }
-
-// Keep only safe filename characters (defends against path traversal).
-static String safeName(const String& in) {
-  String out;
-  for (size_t i = 0; i < in.length(); i++) {
-    char c = in[i];
-    if (isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-') out += c;
+static String imageType(const String& name) {
+  String lower = name; lower.toLowerCase(); return lower.endsWith(".bmp") ? "image/bmp" : "image/jpeg";
+}
+static bool unsignedNumber(const String& text, uint32_t& result) {
+  if (!text.length() || text.length() > 10) return false;
+  uint64_t n = 0;
+  for (size_t i = 0; i < text.length(); ++i) {
+    if (text[i] < '0' || text[i] > '9') return false;
+    n = n * 10 + text[i] - '0'; if (n > UINT32_MAX) return false;
   }
-  return out;
+  result = n; return true;
 }
-
-static bool validImageName(const String& name) {
-  if (name.length() == 0 || name.indexOf("..") >= 0) return false;
-  String low = name;
-  low.toLowerCase();
-  return low.endsWith(".jpg") || low.endsWith(".jpeg") || low.endsWith(".bmp");
-}
-
-static String contentTypeFor(const String& name) {
-  String low = name;
-  low.toLowerCase();
-  if (low.endsWith(".bmp")) return "image/bmp";
-  return "image/jpeg";
-}
-
-// Map an upload filename to a sanitised base (no dir, no extension).
-static String sanitizeBase(const String& filename) {
-  String base = baseNoExt(filename);
-  String out;
-  for (size_t i = 0; i < base.length() && out.length() < 40; i++) {
-    char c = base[i];
-    out += (isalnum((unsigned char)c) || c == '_' || c == '-') ? c : '_';
-  }
-  if (out.length() == 0) out = "photo";
-  return out;
-}
-
-static String jsonEscape(const String& s) {
-  String o;
-  for (size_t i = 0; i < s.length(); i++) {
-    char c = s[i];
-    if (c == '"' || c == '\\') o += '\\';
-    o += c;
-  }
-  return o;
-}
-
-// --------------------------------------------------
-// Embedded pages (PROGMEM)
-// --------------------------------------------------
-
-// The gallery's upload JS re-encodes each image in the browser before
-// sending: cover + centred crop onto an 800x480 canvas (keep the literals in
-// prep() in sync with EPD_WIDTH/EPD_HEIGHT), exported via toBlob() which is
-// always baseline JPEG — so progressive originals never reach the device and
-// uploads shrink to ~100 KB. If decoding fails, the raw file is sent as-is.
-// After each upload it also POSTs a 400x240 JPEG to /thumb; the gallery grid
-// loads /thumb per photo and falls back to /original if none exists yet.
-static const char PAGE_INDEX[] PROGMEM =
-  "<!doctype html><html><head><meta charset=utf-8><meta name=viewport "
-  "content='width=device-width,initial-scale=1'><title>Photo Frame</title>"
-  "<style>body{font-family:system-ui,sans-serif;margin:0;background:#111;color:#eee}"
-  "nav{display:flex;gap:1px;background:#000}nav a{flex:1;text-align:center;padding:14px;"
-  "color:#9cf;text-decoration:none;background:#1c1c1c}nav a:hover{background:#333}"
-  "main{padding:16px;max-width:900px;margin:0 auto}h1{font-size:1.3rem}"
-  "input{padding:8px;margin:4px 0;background:#222;color:#eee;border:1px solid #444;border-radius:6px}"
-  "button{padding:8px 14px;background:#36c;color:#fff;border:0;border-radius:6px;cursor:pointer}"
-  "button:hover{background:#47d}button:disabled{opacity:.4;cursor:default}"
-  ".del{background:#a33}.del:hover{background:#c44}"
-  "#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-top:16px}"
-  ".card{background:#1c1c1c;border-radius:8px;overflow:hidden}"
-  ".card img{width:100%;display:block;background:#000;aspect-ratio:5/3;object-fit:cover}"
-  ".name{padding:6px 8px;font-size:.8rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
-  ".btns{display:flex;gap:6px;padding:8px}.btns button{flex:1}"
-  ".ok{color:#9f9}.proc{color:#fc9}.bad{color:#f99}#status{display:block;margin-top:8px;color:#9f9}</style></head><body>"
-  "<nav><a href='/'>Gallery</a><a href='/wifi'>WiFi</a><a href='/mqtt'>MQTT</a></nav><main>"
-  "<h1>Photo Gallery</h1>"
-  "<form onsubmit='return up(event)'><input type=file id=file accept='.jpg,.jpeg,.bmp' multiple>"
-  "<button>Upload</button> <button type=button onclick='redither()'>Clear dither cache</button>"
-  " <button type=button onclick='testpat()'>Test pattern</button>"
-  "</form><span id=status></span>"
-  "<div id=grid></div></main><script>"
-  "async function load(){const a=await(await fetch('/api/photos')).json();"
-  "const g=document.getElementById('grid');g.innerHTML='';"
-  "if(!a.length){g.innerHTML='<p>No photos yet. Upload some above.</p>';}"
-  "for(const p of a){const n=p.name;const d=document.createElement('div');d.className='card';"
-  "let badge=p.cached?\"<span class=ok>cached</span>\":(p.failed?\"<span class=bad>failed</span>\":\"<span class=proc>not cached</span>\");"
-  "const u=encodeURIComponent(n);"
-  "d.innerHTML=\"<img loading=lazy src='/thumb?file=\"+u+\"' onerror=\\\"this.onerror=null;this.src='/original?file=\"+u+\"'\\\">\"+"
-  "\"<div class=name>\"+n+\" \"+badge+\"</div><div class=btns>\"+"
-  "\"<button onclick=\\\"show('\"+n+\"')\\\">Show</button>\"+"
-  "\"<button class=del onclick=\\\"del('\"+n+\"')\\\">Delete</button></div>\";"
-  "g.appendChild(d);}}"
-  "async function show(n){if(!confirm('Display this photo on the frame now? Uncached photos take a few extra seconds to prepare.'))return;"
-  "const r=await fetch('/show?file='+encodeURIComponent(n),{method:'POST'});"
-  "if(!r.ok){alert('Processing failed.');load();return;}"
-  "alert('Refreshing the panel \\u2014 this takes ~30s.');load();}"
-  "async function del(n){if(!confirm('Delete '+n+'?'))return;"
-  "await fetch('/delete?file='+encodeURIComponent(n),{method:'POST'});load();}"
-  "async function redither(){if(!confirm('Clear the dither cache? Cached panel images are rebuilt automatically the next time each photo is displayed.'))return;"
-  "const s=document.getElementById('status');s.textContent='Clearing cache\\u2026';"
-  "await fetch('/redither',{method:'POST'});s.textContent='Cache cleared.';load();}"
-  "async function testpat(){await fetch('/test',{method:'POST'});"
-  "alert('Drawing colour bars \\u2014 the panel should fill top-to-bottom with 6 stripes (~30s).');}"
-  "async function prep(f){try{"
-  "const bm=await createImageBitmap(f,{imageOrientation:'from-image'});"
-  "const c=document.createElement('canvas');c.width=800;c.height=480;"
-  "const k=Math.max(800/bm.width,480/bm.height);const sw=800/k,sh=480/k;"
-  "c.getContext('2d').drawImage(bm,(bm.width-sw)/2,(bm.height-sh)/2,sw,sh,0,0,800,480);bm.close();"
-  "const b=await new Promise(r=>c.toBlob(r,'image/jpeg',0.9));if(!b)return f;"
-  "return new File([b],f.name.replace(/\\.[^.]*$/,'')+'.jpg',{type:'image/jpeg'});"
-  "}catch(err){return f;}}"
-  "async function mkthumb(f){try{"
-  "const bm=await createImageBitmap(f);"
-  "const c=document.createElement('canvas');c.width=400;c.height=240;"
-  "const k=Math.max(400/bm.width,240/bm.height);const sw=400/k,sh=240/k;"
-  "c.getContext('2d').drawImage(bm,(bm.width-sw)/2,(bm.height-sh)/2,sw,sh,0,0,400,240);bm.close();"
-  "return await new Promise(r=>c.toBlob(r,'image/jpeg',0.8));"
-  "}catch(err){return null;}}"
-  "async function up(e){e.preventDefault();const fs=document.getElementById('file').files;"
-  "if(!fs.length)return false;const s=document.getElementById('status');"
-  "for(let i=0;i<fs.length;i++){s.textContent='Converting '+(i+1)+'/'+fs.length+'\\u2026';"
-  "const f=await prep(fs[i]);"
-  "s.textContent='Uploading '+(i+1)+'/'+fs.length+'\\u2026';"
-  "const fd=new FormData();fd.append('file',f);"
-  "try{const r=await fetch('/upload',{method:'POST',body:fd});const j=await r.json();"
-  "if(j.ok&&j.name){const tb=await mkthumb(f);"
-  "if(tb){const td=new FormData();td.append('file',tb,'t.jpg');"
-  "await fetch('/thumb?name='+encodeURIComponent(j.name),{method:'POST',body:td});}}"
-  "}catch(err){}}"
-  "s.textContent='Uploaded '+fs.length+' file(s).';"
-  "document.getElementById('file').value='';load();return false;}"
-  "window.onload=load;</script></body></html>";
-
-static const char PAGE_WIFI[] PROGMEM =
-  "<!doctype html><html><head><meta charset=utf-8><meta name=viewport "
-  "content='width=device-width,initial-scale=1'><title>WiFi</title>"
-  "<style>body{font-family:system-ui,sans-serif;margin:0;background:#111;color:#eee}"
-  "nav{display:flex;gap:1px;background:#000}nav a{flex:1;text-align:center;padding:14px;"
-  "color:#9cf;text-decoration:none;background:#1c1c1c}nav a:hover{background:#333}"
-  "main{padding:16px;max-width:480px;margin:0 auto}h1{font-size:1.3rem}label{display:block;margin-top:10px}"
-  "input{padding:8px;margin:4px 0;width:100%;box-sizing:border-box;background:#222;color:#eee;"
-  "border:1px solid #444;border-radius:6px}button{padding:10px 16px;margin-top:10px;background:#36c;"
-  "color:#fff;border:0;border-radius:6px;cursor:pointer}#status{display:block;margin-top:10px;color:#9f9}</style></head><body>"
-  "<nav><a href='/'>Gallery</a><a href='/wifi'>WiFi</a><a href='/mqtt'>MQTT</a></nav><main>"
-  "<h1>WiFi Settings</h1><p>Set the network the frame should join. If it can't be found, "
-  "the frame hosts its own setup hotspot instead.</p>"
-  "<form onsubmit='return save(event)'>"
-  "<label>Network name (SSID)</label><input id=ssid>"
-  "<label>Password</label><input id=pass type=password placeholder='(unchanged / leave blank for open)'>"
-  "<button>Save</button></form><span id=status></span></main><script>"
-  "async function load(){const c=await(await fetch('/api/config')).json();"
-  "document.getElementById('ssid').value=c.wifi_ssid||'';}"
-  "async function save(e){e.preventDefault();const b=new URLSearchParams();"
-  "b.append('ssid',document.getElementById('ssid').value);"
-  "b.append('pass',document.getElementById('pass').value);"
-  "const j=await(await fetch('/api/wifi',{method:'POST',"
-  "headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b})).json();"
-  "document.getElementById('status').textContent=j.ok?"
-  "'Saved. Unplug and replug (or reboot) the frame to join this network.':'Error saving';return false;}"
-  "window.onload=load;</script></body></html>";
-
-static const char PAGE_MQTT[] PROGMEM =
-  "<!doctype html><html><head><meta charset=utf-8><meta name=viewport "
-  "content='width=device-width,initial-scale=1'><title>MQTT</title>"
-  "<style>body{font-family:system-ui,sans-serif;margin:0;background:#111;color:#eee}"
-  "nav{display:flex;gap:1px;background:#000}nav a{flex:1;text-align:center;padding:14px;"
-  "color:#9cf;text-decoration:none;background:#1c1c1c}nav a:hover{background:#333}"
-  "main{padding:16px;max-width:480px;margin:0 auto}h1{font-size:1.3rem}label{display:block;margin-top:10px}"
-  "input{padding:8px;margin:4px 0;width:100%;box-sizing:border-box;background:#222;color:#eee;"
-  "border:1px solid #444;border-radius:6px}button{padding:10px 16px;margin-top:10px;background:#36c;"
-  "color:#fff;border:0;border-radius:6px;cursor:pointer}#status{display:block;margin-top:10px;color:#9f9}</style></head><body>"
-  "<nav><a href='/'>Gallery</a><a href='/wifi'>WiFi</a><a href='/mqtt'>MQTT</a></nav><main>"
-  "<h1>MQTT Settings</h1><p>Broker used to report temperature, humidity and battery to "
-  "Home Assistant. Leave the host blank to disable MQTT.</p>"
-  "<form onsubmit='return save(event)'>"
-  "<label>Broker host / IP</label><input id=host>"
-  "<label>Port</label><input id=port type=number value=1883>"
-  "<label>Username</label><input id=user>"
-  "<label>Password</label><input id=pass type=password placeholder='(unchanged / blank for none)'>"
-  "<button>Save</button></form><span id=status></span></main><script>"
-  "async function load(){const c=await(await fetch('/api/config')).json();"
-  "document.getElementById('host').value=c.mqtt_host||'';"
-  "document.getElementById('port').value=c.mqtt_port||1883;"
-  "document.getElementById('user').value=c.mqtt_user||'';}"
-  "async function save(e){e.preventDefault();const b=new URLSearchParams();"
-  "b.append('host',document.getElementById('host').value);"
-  "b.append('port',document.getElementById('port').value);"
-  "b.append('user',document.getElementById('user').value);"
-  "b.append('pass',document.getElementById('pass').value);"
-  "const j=await(await fetch('/api/mqtt',{method:'POST',"
-  "headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b})).json();"
-  "document.getElementById('status').textContent=j.ok?'Saved.':'Error saving';return false;}"
-  "window.onload=load;</script></body></html>";
-
-// --------------------------------------------------
-// Route handlers
-// --------------------------------------------------
-
-static void handleRoot()     { server.send_P(200, "text/html", PAGE_INDEX); }
-static void handleWifiPage()  { server.send_P(200, "text/html", PAGE_WIFI); }
-static void handleMqttPage()  { server.send_P(200, "text/html", PAGE_MQTT); }
-
 static void handleApiPhotos() {
-  String json = "[";
-  File dir = SD.open(ORIGINALS_DIR);
-  bool first = true;
-  if (dir) {
-    File e;
-    while ((e = dir.openNextFile())) {
-      if (!e.isDirectory()) {
-        String n = baseNameOf(String(e.name()));
-        if (validImageName(n)) {
-          String base = baseNoExt(n);
-          bool cached = SD.exists(String(DITHERED_DIR "/") + base + ".bin");
-          bool failed = !cached && isFailedBase(base);
-          if (!first) json += ",";
-          first = false;
-          json += "{\"name\":\"" + jsonEscape(n) + "\",\"cached\":" +
-                  (cached ? "true" : "false") + ",\"failed\":" +
-                  (failed ? "true" : "false") + "}";
-        }
-      }
-      e.close();
-    }
-    dir.close();
+  if (!storageAvailable()) return;
+  uint32_t limit = 24, offset = 0, generation = catalogGeneration();
+  if (server.hasArg("limit") && (!unsignedNumber(server.arg("limit"), limit) || !limit || limit > 48)) {
+    sendError(400, "Page size must be 1-48"); return;
   }
-  json += "]";
-  server.send(200, "application/json", json);
+  String cursor = server.arg("cursor");
+  if (cursor.length()) {
+    int split = cursor.indexOf(':'); uint32_t requested;
+    if (split < 0 || !unsignedNumber(cursor.substring(0, split), requested) ||
+        !unsignedNumber(cursor.substring(split + 1), offset)) { sendError(400, "Invalid cursor"); return; }
+    if (requested != generation) { sendJson(409, "{\"ok\":false,\"restart\":true,\"error\":\"Gallery changed\"}"); return; }
+  }
+  StorageFile dir = storage.open(ORIGINALS_DIR);
+  if (!dir) { sendError(503, "Cannot read photo directory"); return; }
+  uint32_t index = 0, count = 0; bool more = false;
+  String body = "{\"photos\":[";
+  StorageFile f;
+  while ((f = dir.openNextFile())) {
+    String name = photoBaseName(f.name()); bool isPhoto = !f.isDirectory() && validPhotoName(name); f.close();
+    if (!isPhoto || index++ < offset) continue;
+    if (count == limit) { more = true; break; }
+    PhotoMeta m;
+    if (!photoMeta(name, m)) { sendError(503, "Cannot read or save photo metadata"); return; }
+    if (count++) body += ',';
+    bool cached = storage.exists(photoCachePath(m));
+    body += "{\"name\":\"" + jsonEscape(name) + "\",\"revision\":\"" + m.revision +
+      "\",\"thumbnail_revision\":\"" + m.thumbnail + "\",\"cached\":" + (cached ? "true" : "false") +
+      ",\"failed\":" + (!cached && isFailedBase(name) ? "true" : "false") + "}";
+    vTaskDelay(1);
+  }
+  dir.close();
+  if (generation != catalogGeneration()) { sendJson(409, "{\"ok\":false,\"restart\":true}"); return; }
+  body += "],\"generation\":" + String(generation) + ",\"next_cursor\":";
+  body += more ? "\"" + String(generation) + ":" + String(offset + count) + "\"" : "null";
+  sendJson(200, body + "}");
 }
-
 static void handleApiConfig() {
-  String j = "{";
-  j += "\"wifi_ssid\":\"" + jsonEscape(cfgWifiSsid) + "\",";
-  j += "\"mqtt_host\":\"" + jsonEscape(cfgMqttHost) + "\",";
-  j += "\"mqtt_port\":" + String(cfgMqttPort) + ",";
-  j += "\"mqtt_user\":\"" + jsonEscape(cfgMqttUser) + "\",";
-  j += "\"ap_mode\":" + String(apMode ? "true" : "false");
-  j += "}";
-  server.send(200, "application/json", j);
+  ConfigSnapshot c = configSnapshot();
+  sendJson(200, "{\"wifi_ssid\":\"" + jsonEscape(c.ssid) + "\",\"hostname\":\"" + jsonEscape(c.hostname) +
+    "\",\"mqtt_host\":\"" + jsonEscape(c.host) + "\",\"mqtt_port\":" + String(c.port) +
+    ",\"mqtt_user\":\"" + jsonEscape(c.user) + "\",\"wifi_password_saved\":" + (c.wifiPass.length() ? "true" : "false") +
+    ",\"mqtt_password_saved\":" + (c.mqttPass.length() ? "true" : "false") + ",\"ap_mode\":" + (apMode ? "true" : "false") + "}");
 }
-
-// A photo's content never changes under a given name (uploads de-duplicate
-// names, thumbs are written once), so let the browser cache images for a week
-// instead of re-downloading the whole gallery on every visit.
-static const char CACHE_WEEK[] = "max-age=604800";
-
-// streamFile() reads the SD card ~1.4 KB at a time; reading in much larger
-// chunks roughly doubles throughput. Buffer lives in internal RAM (the
-// SD-over-SPI driver's DMA can't touch PSRAM).
-static void streamFileFast(File& f, const String& type) {
-  static uint8_t chunk[16384];
-  server.setContentLength(f.size());
-  server.send(200, type.c_str(), "");
+static String jobJson(const DisplayJob& j) {
+  if (!j.id) return "null";
+  return "{\"id\":" + String(j.id) + ",\"name\":\"" + jsonEscape(j.name) + "\"}";
+}
+static void handleApiStatus() {
+  RuntimeSnapshot s = runtimeSnapshot();
+  uint32_t remaining = (int32_t)(s.nextRotation - millis()) > 0 ? (s.nextRotation - millis()) / 1000 : 0;
+  String body = "{\"now\":" + String(millis()) + ",\"observed_at\":" + String(s.observedAt) +
+    ",\"stage\":\"" + jsonEscape(s.stage) + "\",\"active\":" + jobJson(s.active) + ",\"pending\":" + jobJson(s.pending) +
+    ",\"displayed\":\"" + jsonEscape(s.displayed) + "\",\"last_job\":" + String(s.lastJob) +
+    ",\"display_at\":" + String(s.displayAt) + ",\"next_rotation_seconds\":" + String(remaining) +
+    ",\"storage_total\":" + String((unsigned long long)s.storageTotal) +
+    ",\"storage_free\":" + String((unsigned long long)s.storageFree) + ",\"storage_at\":" + String(s.storageAt) +
+    ",\"sd_ready\":" + (s.sdReady ? "true" : "false") + ",\"mqtt_connected\":" + (s.mqttConnected ? "true" : "false") +
+    ",\"mqtt_state\":" + String(s.mqttState) + ",\"mqtt_at\":" + String(s.mqttAt) +
+    ",\"ap_mode\":" + (apMode ? "true" : "false") + ",\"ip\":\"" + (apMode ? WiFi.softAPIP() : WiFi.localIP()).toString() +
+    "\",\"rssi\":" + String(WiFi.RSSI()) + ",\"hostname\":\"" + String(WiFi.getHostname() ? WiFi.getHostname() : "photoframe") +
+    "\",\"stopping\":" + (s.stopping ? "true" : "false") + ",\"last_error\":\"" + jsonEscape(s.lastError) + "\"}";
+  sendJson(200, body);
+}
+static void serveImage(bool thumbnail) {
+  if (!storageAvailable()) return;
+  String name = server.arg("file");
+  if (!validPhotoName(name)) { sendError(400, "Invalid filename"); return; }
+  PhotoMeta meta;
+  if (!photoMeta(name, meta)) { sendError(404, "Photo not found"); return; }
+  String revision = thumbnail ? meta.thumbnail : meta.revision;
+  String version = server.arg("v");
+  if (version.length() && version != revision) { sendError(404, "Image revision expired"); return; }
+  String path = thumbnail ? photoThumbPath(meta, true) : String(ORIGINALS_DIR "/") + name;
+  String type = thumbnail ? "image/jpeg" : imageType(name);
+  StorageFile f = storage.open(path);
+  if (thumbnail && !f) { f = storage.open(photoThumbPath(meta, false)); type = "image/bmp"; }
+  if (!f) { sendError(404, "Image not available"); return; }
+  String etag = "\"" + revision + "\"";
+  server.sendHeader("ETag", etag);
+  server.sendHeader("Cache-Control", version.length() ? "private, max-age=604800, immutable" : "no-cache");
+  if (server.header("If-None-Match") == etag) { server.send(304); return; }
+  server.setContentLength(f.size()); server.send(200, type, "");
   WiFiClient client = server.client();
-  int n;
-  while ((n = f.read(chunk, sizeof(chunk))) > 0) {
-    size_t off = 0;
-    while (off < (size_t)n) {
-      size_t w = client.write(chunk + off, n - off);
-      if (!w) return;   // client gone
-      off += w;
+  static uint8_t buffer[16384];
+  size_t n;
+  while (!deviceStopping() && (n = f.read(buffer, sizeof(buffer)))) {
+    size_t offset = 0;
+    while (offset < n) {
+      if (deviceStopping()) { client.stop(); return; }
+      size_t wrote = client.write(buffer + offset, n - offset);
+      if (!wrote) { f.close(); return; }
+      offset += wrote;
     }
+    vTaskDelay(1);
   }
-}
-
-static void handleOriginal() {
-  String name = safeName(server.arg("file"));
-  if (!validImageName(name)) { server.send(400, "text/plain", "bad name"); return; }
-  File f = SD.open(String(ORIGINALS_DIR "/") + name);
-  if (!f) { server.send(404, "text/plain", "not found"); return; }
-  server.sendHeader("Cache-Control", CACHE_WEEK);
-  streamFileFast(f, contentTypeFor(name));
   f.close();
 }
 
-// Serve /thumbs/<base>.jpg (browser-uploaded) or .bmp (device-generated).
-// 404 makes the gallery <img> fall back to the full original.
-static void handleThumb() {
-  String name = safeName(server.arg("file"));
-  if (!validImageName(name)) { server.send(400, "text/plain", "bad name"); return; }
-  String base = baseNoExt(name);
-  String type = "image/jpeg";
-  File f = SD.open(String(THUMBS_DIR "/") + base + ".jpg");
-  if (!f) { f = SD.open(String(THUMBS_DIR "/") + base + ".bmp"); type = "image/bmp"; }
-  if (!f) { server.send(404, "text/plain", "no thumb"); return; }
-  server.sendHeader("Cache-Control", CACHE_WEEK);
-  streamFileFast(f, type);
-  f.close();
-}
+struct UploadSession {
+  StorageFile file;
+  UploadAccounting accounting;
+  PhotoMeta meta;
+  String temporary, name, token, error;
+  uint8_t header[54] = {};
+  size_t headerBytes = 0;
+  int status = 400, parts = 0;
+  bool ended = false, duplicate = false, thumbnail = false, leased = false, aborted = false;
+};
+static UploadSession incoming;
 
-// Browser-generated JPEG thumbnail, sent right after a photo upload. The
-// original's final (de-duplicated) name arrives in the query string.
-static void handleThumbUpload() {
+static void resetUpload() {
+  incoming.file.close();
+  if (incoming.temporary.length()) storage.remove(incoming.temporary);
+  if (incoming.leased) endUploadLease();
+  incoming = UploadSession{};
+}
+static void uploadError(int status, const String& error) {
+  if (!incoming.error.length()) { incoming.status = status; incoming.error = error; }
+  incoming.accounting.failed = true;
+  incoming.file.close();
+  if (incoming.temporary.length()) storage.remove(incoming.temporary);
+}
+static String uploadName(const String& original) {
+  String name = photoBaseName(original), lower = name; lower.toLowerCase();
+  String extension = lower.endsWith(".jpeg") ? ".jpeg" : lower.endsWith(".jpg") ? ".jpg" : lower.endsWith(".bmp") ? ".bmp" : "";
+  if (!extension.length()) return "";
+  String base;
+  for (int i = 0; i < name.lastIndexOf('.') && base.length() < 40; ++i) {
+    char c = name[i]; base += isalnum((uint8_t)c) && (uint8_t)c < 128 ? c : '_';
+  }
+  if (!base.length()) base = "photo";
+  String candidate = base + extension;
+  for (uint32_t i = 1; storage.exists(String(ORIGINALS_DIR "/") + candidate); ++i) candidate = base + "_" + String(i) + extension;
+  return candidate;
+}
+static void receiveUpload(bool thumbnail) {
   HTTPUpload& up = server.upload();
   if (up.status == UPLOAD_FILE_START) {
-    thumbStored = false;
-    String name = safeName(server.arg("name"));
-    if (!validImageName(name)) return;
-    ensureDirs();
-    thumbFile = SD.open((String(THUMBS_DIR "/") + baseNoExt(name) + ".jpg").c_str(), FILE_WRITE);
-  } else if (up.status == UPLOAD_FILE_WRITE) {
-    if (thumbFile) thumbFile.write(up.buf, up.currentSize);
-  } else if (up.status == UPLOAD_FILE_END) {
-    if (thumbFile) {
-      thumbFile.close();
-      thumbStored = true;
+    if (incoming.aborted) resetUpload();
+    if (++incoming.parts != 1) { uploadError(400, "Send one file per request"); return; }
+    incoming.thumbnail = thumbnail;
+    if (!runtimeSnapshot().sdReady || deviceStopping()) { uploadError(503, "Storage unavailable"); return; }
+    String leaseError;
+    String name = thumbnail ? server.arg("name") : "";
+    if (!beginUploadLease(name, leaseError)) { uploadError(409, leaseError); return; }
+    incoming.leased = true;
+    if (thumbnail) {
+      if (!validPhotoName(name) || !photoMeta(name, incoming.meta)) { uploadError(404, "Photo not found"); return; }
+      incoming.name = name;
+    } else {
+      incoming.token = server.arg("token");
+      if (!incoming.token.length()) incoming.token = newRevision(); // legacy clients
+      if (!validToken(incoming.token)) { uploadError(400, "Invalid upload token"); return; }
+      incoming.duplicate = findUploadToken(incoming.token, incoming.meta);
+      incoming.name = incoming.duplicate ? String(incoming.meta.name) : uploadName(up.filename);
+      if (!incoming.name.length()) { uploadError(415, "Supported types: JPEG and BMP"); return; }
     }
+    if (!incoming.duplicate) {
+      incoming.temporary = "/upload-temp/" + newRevision() + ".part";
+      incoming.file = storage.open(incoming.temporary, FILE_WRITE);
+      if (!incoming.file) uploadError(507, "Cannot create upload file on SD card");
+    }
+  } else if (up.status == UPLOAD_FILE_WRITE && !incoming.error.length()) {
+    if (deviceStopping()) { uploadError(503, "USB power removed"); server.client().stop(); return; }
+    size_t limit = thumbnail ? 256u * 1024 : 20u * 1024 * 1024;
+    if (up.currentSize > limit || incoming.accounting.received > limit - up.currentSize) { uploadError(413, "Image exceeds upload limit"); return; }
+    size_t copied = min(up.currentSize, sizeof(incoming.header) - incoming.headerBytes);
+    memcpy(incoming.header + incoming.headerBytes, up.buf, copied); incoming.headerBytes += copied;
+    size_t wrote = incoming.duplicate ? up.currentSize : incoming.file.write(up.buf, up.currentSize);
+    if (!incoming.accounting.add(up.currentSize, wrote, limit)) uploadError(507, "SD card write failed or card is full");
+  } else if (up.status == UPLOAD_FILE_END && !incoming.error.length()) {
+    String lower = incoming.name; lower.toLowerCase();
+    if (!incoming.accounting.complete(up.totalSize) ||
+        !imageSignature(incoming.header, incoming.headerBytes, !thumbnail && lower.endsWith(".bmp"))) {
+      uploadError(415, "Incomplete file or image signature does not match its type"); return;
+    }
+    if (incoming.duplicate) {
+      if (incoming.accounting.received != incoming.meta.size) { uploadError(409, "Upload token was already used for a different file"); return; }
+    } else {
+      incoming.file.flush();
+      if (incoming.file.size() != incoming.accounting.received) { uploadError(507, "SD file size verification failed"); return; }
+      incoming.file.close();
+    }
+    incoming.ended = true;
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    uploadError(400, "Upload interrupted"); resetUpload(); incoming.aborted = true;
   }
 }
-
-static void handleThumbDone() {
-  server.send(thumbStored ? 200 : 400, "application/json",
-              thumbStored ? "{\"ok\":true}" : "{\"ok\":false}");
+static void finishUpload() {
+  if (!incoming.ended || incoming.error.length()) {
+    sendError(incoming.status, incoming.error.length() ? incoming.error : "No complete image received"); resetUpload(); return;
+  }
+  bool committed = incoming.duplicate;
+  {
+    MutexGuard catalog(catalogMutex);
+    if (!committed && incoming.thumbnail) {
+      PhotoMeta previous = incoming.meta;
+      strlcpy(incoming.meta.thumbnail, newRevision().c_str(), sizeof(incoming.meta.thumbnail));
+      String finalPath = photoThumbPath(incoming.meta, true);
+      committed = storage.rename(incoming.temporary, finalPath) && savePhotoMeta(incoming.meta);
+      if (committed) {
+        storage.remove(photoThumbPath(previous, true)); storage.remove(photoThumbPath(previous, false));
+      } else storage.remove(finalPath);
+    } else if (!committed) {
+      incoming.meta = PhotoMeta{};
+      StorageFile f = storage.open(incoming.temporary);
+      incoming.meta.size = f.size(); incoming.meta.modified = f.getLastWrite(); f.close();
+      strlcpy(incoming.meta.name, incoming.name.c_str(), sizeof(incoming.meta.name));
+      strlcpy(incoming.meta.revision, newRevision().c_str(), sizeof(incoming.meta.revision));
+      strlcpy(incoming.meta.thumbnail, newRevision().c_str(), sizeof(incoming.meta.thumbnail));
+      strlcpy(incoming.meta.token, incoming.token.c_str(), sizeof(incoming.meta.token));
+      // Receipt and metadata precede the final source rename. A retry is only
+      // considered committed when the source exists with the recorded stats.
+      committed = saveUploadReceipt(incoming.meta) && savePhotoMeta(incoming.meta) &&
+                  storage.rename(incoming.temporary, String(ORIGINALS_DIR "/") + incoming.name);
+      if (committed) clearFailedBase(incoming.name);
+    }
+    if (committed) catalogChanged();
+  }
+  if (committed) sendJson(200, "{\"ok\":true,\"name\":\"" + jsonEscape(incoming.name) + "\",\"revision\":\"" + incoming.meta.revision + "\"}");
+  else sendError(507, "Could not commit upload to SD card");
+  resetUpload();
 }
-
 static void handleDelete() {
-  String name = safeName(server.arg("file"));
-  if (!validImageName(name)) { server.send(400, "application/json", "{\"ok\":false}"); return; }
-  String base = baseNoExt(name);
-  String orig = String(ORIGINALS_DIR "/") + name;
-  String bin  = String(DITHERED_DIR "/") + base + ".bin";
-
-  bool removed = false;
-  if (SD.exists(orig)) removed = SD.remove(orig);
-  if (SD.exists(bin))  SD.remove(bin);
-  String tj = String(THUMBS_DIR "/") + base + ".jpg";
-  String tb = String(THUMBS_DIR "/") + base + ".bmp";
-  if (SD.exists(tj)) SD.remove(tj);
-  if (SD.exists(tb)) SD.remove(tb);
-  clearFailedBase(base);
-
-  server.send(removed ? 200 : 404, "application/json",
-              removed ? "{\"ok\":true}" : "{\"ok\":false}");
+  if (!storageAvailable()) return;
+  String name = server.arg("file"), error;
+  if (!validPhotoName(name)) { sendError(400, "Invalid filename"); return; }
+  if (deletePhoto(name, error)) { clearFailedBase(name); sendJson(200, "{\"ok\":true}"); }
+  else sendError(photoInUse(name) || maintenanceBusy() ? 409 : 500, error);
 }
-
-static void handleShow() {
-  String name = safeName(server.arg("file"));
-  if (!validImageName(name)) { server.send(400, "application/json", "{\"ok\":false}"); return; }
-  if (!SD.exists(String(ORIGINALS_DIR "/") + name)) {
-    server.send(404, "application/json", "{\"ok\":false,\"error\":\"no such photo\"}");
-    return;
-  }
-  // May take a few seconds on a cache miss (decode + dither); the WebServer is
-  // synchronous, so the client just waits for the response.
-  if (!ensureDitheredInBuffer(name)) {
-    server.send(500, "application/json", "{\"ok\":false,\"error\":\"processing failed\"}");
-    return;
-  }
-  server.send(200, "application/json", "{\"ok\":true}");
-  epdDisplayCurrentBuffer();   // slow refresh; client already acknowledged
+static void handleDisplayRequest(DisplayKind kind) {
+  if (kind != DisplayKind::Test && !storageAvailable()) return;
+  String error; uint32_t id;
+  if (queueDisplay(kind, server.arg("file"), true, id, error))
+    sendJson(202, "{\"ok\":true,\"job_id\":" + String(id) + "}");
+  else sendError(error == "Photo not found" ? 404 : 409, error);
 }
-
-// Upload: stream the original straight into /originals. Dithering happens
-// lazily the first time the photo is displayed (ensureDitheredInBuffer).
-static void handleUpload() {
-  HTTPUpload& up = server.upload();
-  if (up.status == UPLOAD_FILE_START) {
-    uploadStored = false;
-    uploadFinalName = "";
-    String low = up.filename; low.toLowerCase();
-    String ext;
-    if      (low.endsWith(".jpeg")) ext = ".jpeg";
-    else if (low.endsWith(".jpg"))  ext = ".jpg";
-    else if (low.endsWith(".bmp"))  ext = ".bmp";
-    else { Serial.println("Upload rejected (unsupported type)"); return; }
-
-    ensureDirs();
-    String base = sanitizeBase(up.filename);
-    String path = String(ORIGINALS_DIR "/") + base + ext;
-    int n = 1;
-    while (SD.exists(path)) path = String(ORIGINALS_DIR "/") + base + "_" + String(n++) + ext;
-    uploadFile = SD.open(path.c_str(), FILE_WRITE);
-    if (uploadFile) uploadFinalName = baseNameOf(path);
-  } else if (up.status == UPLOAD_FILE_WRITE) {
-    if (uploadFile) uploadFile.write(up.buf, up.currentSize);
-  } else if (up.status == UPLOAD_FILE_END) {
-    if (uploadFile) {
-      uploadFile.close();
-      uploadStored = true;
-    }
-  }
-}
-
-static void handleUploadDone() {
-  if (!uploadStored) {
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"unsupported type\"}");
-    return;
-  }
-  server.send(200, "application/json",
-              "{\"ok\":true,\"name\":\"" + jsonEscape(uploadFinalName) + "\"}");
-}
-
-// Clear the dither cache: delete every cached buffer. Each photo is rebuilt
-// lazily from its original the next time it is displayed. Use after changing
-// the dither pipeline or to recover corrupt .bins.
-static void handleRedither() {
-  int removed = 0;
-  while (true) {
-    File dir = SD.open(DITHERED_DIR);
-    if (!dir) break;
-    String victim;
-    File e;
-    while ((e = dir.openNextFile())) {
-      if (!e.isDirectory()) {
-        String n = baseNameOf(String(e.name()));
-        String low = n; low.toLowerCase();
-        if (low.endsWith(".bin")) { victim = String(DITHERED_DIR "/") + n; e.close(); break; }
-      }
-      e.close();
-    }
-    dir.close();
-    if (victim.length() == 0) break;     // no more .bin files
-    if (!SD.remove(victim)) break;       // stop if a delete fails
-    removed++;
-  }
-
-  clearAllFailed();
-  server.send(200, "application/json", "{\"ok\":true,\"removed\":" + String(removed) + "}");
-}
-
-// Diagnostic: draw 6 colour bars straight into the framebuffer and display them.
-// Bypasses SD / decode / dither / .bin entirely, so it isolates the panel write
-// path from the image pipeline. If the bars fill the screen but photos don't,
-// the problem is in the image/.bin path, not the EPD driver.
-static void handleTest() {
-  epdDrawHorizontalBars();
-  server.send(200, "application/json", "{\"ok\":true}");
-  epdDisplayCurrentBuffer();
-}
-
 static void handleSaveWifi() {
-  configSaveWifi(server.arg("ssid"), server.arg("pass"));
-  server.send(200, "application/json", "{\"ok\":true}");
+  if (deviceStopping()) { sendError(503, "Device stopping"); return; }
+  String error, hostname = server.hasArg("hostname") ? server.arg("hostname") : configSnapshot().hostname;
+  if (configSaveWifi(server.arg("ssid"), server.arg("pass"), server.arg("clear_password") == "true", hostname, error)) sendJson(200, "{\"ok\":true}");
+  else sendError(error.startsWith("Invalid") ? 400 : 500, error);
 }
-
 static void handleSaveMqtt() {
-  uint16_t port = (uint16_t)server.arg("port").toInt();
-  if (port == 0) port = 1883;
-  configSaveMqtt(server.arg("host"), port, server.arg("user"), server.arg("pass"));
-  server.send(200, "application/json", "{\"ok\":true}");
+  if (deviceStopping()) { sendError(503, "Device stopping"); return; }
+  String error;
+  if (configSaveMqtt(server.arg("host"), server.arg("port"), server.arg("user"), server.arg("pass"), server.arg("clear_password") == "true", error)) sendJson(200, "{\"ok\":true}");
+  else sendError(error.startsWith("Invalid") ? 400 : 500, error);
 }
-
-static void handleNotFound() {
-  if (apMode) {
-    // Captive-portal style redirect to the gallery.
-    server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/");
-    server.send(302, "text/plain", "");
-  } else {
-    server.send(404, "text/plain", "Not found");
+static void httpService(void*) {
+  const char* headers[] = {"If-None-Match"}; server.collectHeaders(headers, 1);
+  server.on("/", HTTP_GET, [] { server.sendHeader("Cache-Control", "no-cache"); server.send_P(200, "text/html; charset=utf-8", PAGE_INDEX); });
+  server.on("/wifi", HTTP_GET, [] { server.sendHeader("Cache-Control", "no-cache"); server.send_P(200, "text/html; charset=utf-8", PAGE_WIFI); });
+  server.on("/mqtt", HTTP_GET, [] { server.sendHeader("Cache-Control", "no-cache"); server.send_P(200, "text/html; charset=utf-8", PAGE_MQTT); });
+  server.on("/app.js", HTTP_GET, [] { server.sendHeader("Cache-Control", "no-cache"); server.send_P(200, "text/javascript", ASSET_APP_JS); });
+  server.on("/app.css", HTTP_GET, [] { server.sendHeader("Cache-Control", "no-cache"); server.send_P(200, "text/css", ASSET_APP_CSS); });
+  server.on("/api/photos", HTTP_GET, handleApiPhotos);
+  server.on("/api/config", HTTP_GET, handleApiConfig);
+  server.on("/api/status", HTTP_GET, handleApiStatus);
+  server.on("/original", HTTP_GET, [] { serveImage(false); });
+  server.on("/thumb", HTTP_GET, [] { serveImage(true); });
+  server.on("/upload", HTTP_POST, finishUpload, [] { receiveUpload(false); });
+  server.on("/thumb", HTTP_POST, finishUpload, [] { receiveUpload(true); });
+  server.on("/delete", HTTP_POST, handleDelete);
+  server.on("/show", HTTP_POST, [] { handleDisplayRequest(DisplayKind::Photo); });
+  server.on("/test", HTTP_POST, [] { handleDisplayRequest(DisplayKind::Test); });
+  server.on("/redither", HTTP_POST, [] { handleDisplayRequest(DisplayKind::ClearCache); });
+  server.on("/api/wifi", HTTP_POST, handleSaveWifi);
+  server.on("/api/mqtt", HTTP_POST, handleSaveMqtt);
+  server.onNotFound([] {
+    if (apMode && server.method() == HTTP_GET && !server.uri().startsWith("/api/")) {
+      server.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/"); server.send(302, "text/plain", "");
+    } else sendError(404, "Not found");
+  });
+  if (apMode) dnsServer.start(53, "*", WiFi.softAPIP());
+  server.begin();
+  while (!deviceStopping()) {
+    server.handleClient();
+    // Multipart parsing is synchronous in WebServer. A parser failure after
+    // FILE_END can bypass both the completion and abort callbacks; never let
+    // that leave a temporary file or photo lease attached to the next request.
+    if (incoming.parts) {
+      operationError("Upload interrupted before the request completed");
+      resetUpload();
+    }
+    if (apMode) dnsServer.processNextRequest();
+    networkDiscoveryTick();
+    vTaskDelay(1);
+  }
+  resetUpload(); server.stop(); dnsServer.stop(); networkDiscoveryStop();
+  xSemaphoreGive(httpStopped);
+  vTaskDelete(nullptr);
+}
+void webServerBegin() {
+  httpStopped = xSemaphoreCreateBinary();
+  if (!httpStopped || xTaskCreate(httpService, "photo-http", 12288, nullptr, 1, &httpTask) != pdPASS) {
+    httpTask = nullptr; operationError("Could not start HTTP task");
   }
 }
-
-// --------------------------------------------------
-// Public entry points
-// --------------------------------------------------
-
-void webServerBegin() {
-  ensureDirs();
-
-  if (apMode) dnsServer.start(53, "*", WiFi.softAPIP());
-
-  server.on("/",           HTTP_GET,  handleRoot);
-  server.on("/wifi",       HTTP_GET,  handleWifiPage);
-  server.on("/mqtt",       HTTP_GET,  handleMqttPage);
-  server.on("/api/photos", HTTP_GET,  handleApiPhotos);
-  server.on("/api/config", HTTP_GET,  handleApiConfig);
-  server.on("/original",   HTTP_GET,  handleOriginal);
-  server.on("/thumb",      HTTP_GET,  handleThumb);
-  server.on("/thumb",      HTTP_POST, handleThumbDone, handleThumbUpload);
-  server.on("/delete",     HTTP_POST, handleDelete);
-  server.on("/show",       HTTP_POST, handleShow);
-  server.on("/redither",   HTTP_POST, handleRedither);
-  server.on("/test",       HTTP_POST, handleTest);
-  server.on("/upload",     HTTP_POST, handleUploadDone, handleUpload);
-  server.on("/api/wifi",   HTTP_POST, handleSaveWifi);
-  server.on("/api/mqtt",   HTTP_POST, handleSaveMqtt);
-  server.onNotFound(handleNotFound);
-
-  server.begin();
-  Serial.println("Web server started on port 80");
-}
-
-void webServerHandle() {
-  server.handleClient();
-  if (apMode) dnsServer.processNextRequest();
+void webServerStop() {
+  { MutexGuard g(stateMutex); runtimeState.stopping = true; runtimeState.pending = DisplayJob{}; }
+  if (httpTask) { xSemaphoreTake(httpStopped, portMAX_DELAY); httpTask = nullptr; }
 }

@@ -91,7 +91,7 @@ static uint32_t lastSensor     = 0;
 static uint32_t lastRotate     = 0;
 static uint32_t lastPowerCheck = 0;
 
-// Session-only set of originals that failed to decode/render, so the display
+// Session-only set of complete filenames that failed to decode/render, so the display
 // paths skip them instead of retrying in a tight loop.
 static String   failedBases[MAX_FAILED];
 static int      failedCount = 0;
@@ -179,13 +179,14 @@ void overlayLowBatteryIcon() {
 // Originals live in /originals. Nothing is processed at upload time; instead,
 // the first time a photo is displayed it is decoded, resized + dithered
 // straight into the panel framebuffer (epdBuffer) and the result is saved as
-// /dithered/<base>.bin. Later displays of the same photo are a pure cache
+// a source/revision-specific dither cache. Later displays of the same photo are a pure cache
 // load. Failures are parked in a session-only set so a bad file isn't retried
 // in a tight loop. The decode/resize/dither loops yield periodically
 // (vTaskDelay) so long jobs don't starve the idle task / trip the watchdog.
 // --------------------------------------------------
 
 bool isFailedBase(const String& base) {
+  MutexGuard guard(stateMutex);
   for (int i = 0; i < failedCount; i++) {
     if (failedBases[i] == base) return true;
   }
@@ -193,12 +194,14 @@ bool isFailedBase(const String& base) {
 }
 
 static void markFailedBase(const String& base) {
+  MutexGuard guard(stateMutex);
   if (isFailedBase(base)) return;
   if (failedCount < MAX_FAILED) failedBases[failedCount++] = base;
 }
 
 // Forget a base (e.g. on delete) so a re-upload of the same name is retried.
 void clearFailedBase(const String& base) {
+  MutexGuard guard(stateMutex);
   for (int i = 0; i < failedCount; i++) {
     if (failedBases[i] == base) { failedBases[i] = failedBases[--failedCount]; return; }
   }
@@ -206,27 +209,11 @@ void clearFailedBase(const String& base) {
 
 // Forget all failures (e.g. on "re-dither all") so everything is retried.
 void clearAllFailed() {
+  MutexGuard guard(stateMutex);
   failedCount = 0;
 }
 
-// True for filenames we can actually decode (ignores stray files on the card).
-static bool hasImageExt(const String& nm) {
-  String low = nm;
-  low.toLowerCase();
-  return low.endsWith(".jpg") || low.endsWith(".jpeg") || low.endsWith(".bmp");
-}
-
-// Strip directory and extension → base name.
-static String baseOf(const String& filename) {
-  String b = filename;
-  int s = b.lastIndexOf('/');
-  if (s >= 0) b = b.substring(s + 1);
-  int dot = b.lastIndexOf('.');
-  if (dot > 0) b = b.substring(0, dot);
-  return b;
-}
-
-// Ensure /dithered/<base>.bin exists for the given original (basename with
+// Ensure a source/revision-specific dither cache exists for the given original (basename with
 // extension) and leave the image in epdBuffer, ready for
 // epdDisplayCurrentBuffer(). Cache hit: load the .bin (a corrupt/short .bin is
 // deleted and re-rendered). Miss: decode /originals/<name>, resize + dither
@@ -235,37 +222,29 @@ static String baseOf(const String& filename) {
 // time); a failed decode or render marks the base failed and returns false.
 bool ensureDitheredInBuffer(const String& origName) {
   if (!epdBuffer) return false;
-
-  String base    = baseOf(origName);
-  String binPath = String(DITHERED_DIR "/") + base + ".bin";
-
-  if (SD.exists(binPath)) {
+  PhotoMeta meta;
+  if (!photoMeta(origName, meta)) { displayFailure("Photo metadata unavailable"); return false; }
+  String binPath = photoCachePath(meta);
+  if (storage.exists(binPath)) {
     if (epdLoadBufferFromFile(binPath.c_str())) {
-      thumbEnsureFromBuffer(base);   // backfill a gallery thumb for old photos
+      thumbEnsureFromBuffer(origName);
       return true;
     }
-    Serial.printf("Corrupt cache %s — re-rendering\n", binPath.c_str());
-    SD.remove(binPath);
+    storage.remove(binPath);
   }
-
-  String srcPath = String(ORIGINALS_DIR "/") + origName;
-  Serial.printf("Rendering (lazy): %s -> %s\n", srcPath.c_str(), binPath.c_str());
-
-  if (!imgDecode(srcPath.c_str()) || !imgRenderToBuffer(epdBuffer)) {
-    Serial.printf("Processing failed for %s (parked)\n", srcPath.c_str());
-    markFailedBase(base);
-    return false;
+  String source = String(ORIGINALS_DIR "/") + origName;
+  if (!imgDecode(source.c_str()) || !imgRenderToBuffer(epdBuffer)) {
+    displayFailure("Could not decode or render " + origName);
+    markFailedBase(origName); return false;
   }
-
-  // Battery mode never runs the web server's ensureDirs().
-  if (!SD.exists(DITHERED_DIR)) SD.mkdir(DITHERED_DIR);
-
-  if (!epdSaveBufferToFile(binPath.c_str(), epdBuffer)) {
-    Serial.println("WARN: cache write failed (will retry next display)");
+  String temp = binPath + ".part";
+  if (!epdSaveBufferToFile(temp.c_str(), epdBuffer) || !storage.rename(temp, binPath)) {
+    storage.remove(temp);
+    operationError("Displayed photo could not be cached; will retry next time");
   }
-
-  clearFailedBase(base);  // an explicit retry (e.g. /show) can un-park a base
-  thumbEnsureFromBuffer(base);
+  clearFailedBase(origName);
+  thumbEnsureFromBuffer(origName);
+  storageChanged();
   return true;
 }
 
@@ -278,19 +257,19 @@ bool displayRandomFromSD() {
 
   for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     // Pass 1: count displayable originals (decodable extension, not parked).
-    File dir = SD.open(ORIGINALS_DIR);
+    StorageFile dir = storage.open(ORIGINALS_DIR);
     if (!dir) {
       Serial.println("No /originals directory on SD card");
       return false;
     }
     int count = 0;
-    File e;
+    StorageFile e;
     while ((e = dir.openNextFile())) {
       if (!e.isDirectory()) {
         String nm = String(e.name());
         int s = nm.lastIndexOf('/');
         if (s >= 0) nm = nm.substring(s + 1);
-        if (hasImageExt(nm) && !isFailedBase(baseOf(nm))) count++;
+        if (validPhotoName(nm) && !isFailedBase(nm)) count++;
       }
       e.close();
     }
@@ -304,7 +283,7 @@ bool displayRandomFromSD() {
     int target = esp_random() % count;
 
     // Pass 2: walk to the target-th displayable original.
-    dir = SD.open(ORIGINALS_DIR);
+    dir = storage.open(ORIGINALS_DIR);
     String chosen;
     int i = 0;
     while ((e = dir.openNextFile())) {
@@ -312,7 +291,7 @@ bool displayRandomFromSD() {
         String nm = String(e.name());
         int s = nm.lastIndexOf('/');
         if (s >= 0) nm = nm.substring(s + 1);
-        if (hasImageExt(nm) && !isFailedBase(baseOf(nm))) {
+        if (validPhotoName(nm) && !isFailedBase(nm)) {
           if (i == target) {
             chosen = nm;
             e.close();
@@ -327,10 +306,9 @@ bool displayRandomFromSD() {
 
     if (chosen.length() == 0) return false;  // card changed under us
 
-    // A failed render parks the base, so the next attempt's scan excludes it.
-    if (ensureDitheredInBuffer(chosen)) {
+    // A failed render parks the filename, so the next attempt's scan excludes it.
+    if (displayNamedPhoto(chosen)) {
       Serial.printf("Displaying [%d/%d]: %s\n", target, count, chosen.c_str());
-      epdDisplayCurrentBuffer();
       return true;
     }
   }
@@ -364,6 +342,7 @@ void enterDeepSleep() {
 // --------------------------------------------------
 
 void setup() {
+  synchronizationBegin();
   Serial.begin(115200);
   delay(500);
 
@@ -433,14 +412,16 @@ void setup() {
     serverMode = true;
 
     if (!epdInit()) Serial.println("WARN: framebuffer alloc failed");
-    if (!sdInit())  Serial.println("WARN: SD card init failed");
+    bool sdReady = sdInit();
+    if (sdReady && !photoStoreBegin()) operationError("Could not prepare all storage directories; card may be full or read-only");
+    runtimeBegin(sdReady);
 
     wifiBringUp();        // STA if saved network reachable, else host AP
+    uint32_t startupJob; String startupError;
+    queueDisplay(DisplayKind::Random, "", false, startupJob, startupError);
     webServerBegin();
 
-    // Show a photo immediately so the panel isn't blank. May decode+dither
-    // for a few seconds first if the random pick isn't cached yet.
-    displayRandomFromSD();
+    // The initial display is queued; HTTP remains available during startup work.
 
     // Initial sensor report (no-op in AP mode or if MQTT unconfigured).
     sensorReport();
@@ -480,6 +461,7 @@ void setup() {
   // Display update (rotate a stored photo from the SD card)
   if (doDisplayUpdate) {
     if (epdInit() && sdInit()) {
+      photoStoreBegin(); // existing sources can still render on a full card
       displayRandomFromSD();
     } else {
       Serial.println("Skipping display update (EPD/SD init failed)");
@@ -499,7 +481,7 @@ void loop() {
     return;
   }
 
-  webServerHandle();
+  controlTick();
 
   uint32_t now = millis();
 
@@ -511,7 +493,8 @@ void loop() {
     delay(20);                               // debounce
     if (digitalRead(PIN_BUTTON) == LOW) {
       Serial.println("Button pressed — cycling image");
-      displayRandomFromSD();
+      uint32_t job; String error;
+      queueDisplay(DisplayKind::Random, "", true, job, error);
       lastRotate = millis();                 // restart the auto-rotate timer
     }
   }
@@ -524,13 +507,15 @@ void loop() {
 
   if (now - lastRotate >= ROTATE_INTERVAL_MS) {
     lastRotate = now;
-    displayRandomFromSD();
+    uint32_t job; String error;
+    queueDisplay(DisplayKind::Random, "", false, job, error);
   }
 
   if (now - lastPowerCheck >= POWER_CHECK_MS) {
     lastPowerCheck = now;
     if (!pmuVbusPresent()) {
       Serial.println("USB power removed — switching to battery sleep mode");
+      webServerStop();
       enterDeepSleep();
     }
   }

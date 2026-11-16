@@ -1,0 +1,10 @@
+{
+  "name": "photoframe-web-tests",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/crop.test.cjs",
+    "test:browser": "playwright test",
+    "assets:check": "python tools/embed_web.py --check"
+  },
+  "devDependencies": { "@playwright/test": "1.65.1" }
+}

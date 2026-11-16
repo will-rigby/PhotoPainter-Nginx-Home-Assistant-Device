@@ -1,1 +1,5 @@
 secrets.h
+.build/
+node_modules/
+test-results/
+__pycache__/

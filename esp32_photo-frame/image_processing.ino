@@ -42,7 +42,7 @@ static int        jpgDecodeW    = 0;         // buffer width (memory stride)
 static int        jpgDecodeH    = 0;         // buffer height
 static int        jpgFillW      = 0;         // actual width JPEGDEC filled
 static int        jpgFillH      = 0;         // actual height JPEGDEC filled
-static File       jpgFile;                   // kept open during decode
+static StorageFile jpgFile;                   // kept open during decode
 
 // Progressive-JPEG coefficient buffer hooks: the fork allocates its multi-scan
 // coefficient store (~3 B/px full-res for 4:2:0, 6 B/px for 4:4:4) through
@@ -62,7 +62,7 @@ static void jpgCoefFree(void* p) {
 // --------------------------------------------------
 
 static void* jpgOpen(const char* filename, int32_t* pSize) {
-  jpgFile = SD.open(filename);
+  jpgFile = storage.open(filename);
   if (!jpgFile) return nullptr;
   *pSize = jpgFile.size();
   return &jpgFile;
@@ -88,7 +88,7 @@ static int jpgDrawCB(JPEGDRAW* pDraw) {
   if (!jpgDecodeBuf) return 0;
 
   // The callback fires many times during a decode; yield occasionally so the
-  // decode (which runs on the dither task, core 0) doesn't starve the idle task
+  // decode on the control task does not starve the HTTP or idle tasks
   // and trip the watchdog.
   static uint16_t cbCount = 0;
   if ((++cbCount & 15) == 0) vTaskDelay(1);
@@ -194,7 +194,7 @@ static bool decodeJPEG(const char* path) {
 // --------------------------------------------------
 
 static bool decodeBMP(const char* path) {
-  File f = SD.open(path);
+  StorageFile f = storage.open(path);
   if (!f) { Serial.println("BMP open failed"); return false; }
 
   // Read BMP header
@@ -212,6 +212,7 @@ static bool decodeBMP(const char* path) {
   uint32_t compress   = *(uint32_t*)&hdr[30];
 
   bool bottomUp = (bmpH > 0);
+  if (bmpH == INT32_MIN || bmpW <= 0 || bmpH == 0 || bmpW > 16384 || bmpH > 16384 || bmpH < -16384) { f.close(); return false; }
   if (bmpH < 0) bmpH = -bmpH;
 
   Serial.printf("BMP %dx%d %dbpp\n", bmpW, bmpH, bpp);
@@ -226,6 +227,8 @@ static bool decodeBMP(const char* path) {
   jpgFillW   = bmpW;   // BMP path fills the whole buffer
   jpgFillH   = bmpH;
 
+  uint64_t required = uint64_t((bmpW * 3 + 3) & ~3) * bmpH + dataOffset;
+  if (dataOffset < 54 || required > f.size()) { f.close(); return false; }
   size_t bufBytes = (size_t)bmpW * bmpH * 2;
   jpgDecodeBuf = (uint16_t*)ps_malloc(bufBytes);
   if (!jpgDecodeBuf) {
@@ -248,7 +251,9 @@ static bool decodeBMP(const char* path) {
   for (int y = 0; y < bmpH; y++) {
     if ((y & 31) == 0) vTaskDelay(1);   // yield so core-0 idle/WDT stays happy
     int dstY = bottomUp ? (bmpH - 1 - y) : y;
-    f.read(rowBuf, bmpW * 3 + rowPad);
+    if (f.read(rowBuf, bmpW * 3 + rowPad) != size_t(bmpW * 3 + rowPad)) {
+      free(rowBuf); free(jpgDecodeBuf); jpgDecodeBuf = nullptr; f.close(); return false;
+    }
 
     for (int x = 0; x < bmpW; x++) {
       uint8_t b = rowBuf[x * 3 + 0];
@@ -466,12 +471,11 @@ static bool floydSteinbergDither(uint8_t* dst, uint8_t* rgb, int w, int h) {
 }
 
 // --------------------------------------------------
-// Two-phase pipeline (so the background task can hold the SD lock only while
-// it actually touches the card):
+// Two-phase control-task pipeline; StorageFile locks individual SD operations:
 //   imgDecode()         — reads the source file from SD into jpgDecodeBuf  [SD]
 //   imgRenderToBuffer() — resize + dither into the caller's buffer         [CPU]
 // The JPEGDEC globals (jpgDecodeBuf, jpgFillW/H, …) are touched only by the
-// dither task, so they need no locking themselves.
+// control task, so they need no locking themselves.
 // --------------------------------------------------
 
 bool imgDecode(const char* filepath) {
@@ -529,12 +533,15 @@ bool imgRenderToBuffer(uint8_t* target) {
 static void bmpPutU32(uint8_t* p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
 static void bmpPutU16(uint8_t* p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
 
-void thumbEnsureFromBuffer(const String& base) {
+void thumbEnsureFromBuffer(const String& name) {
   if (!epdBuffer) return;
-  if (SD.exists(String(THUMBS_DIR "/") + base + ".jpg")) return;
-  String bp = String(THUMBS_DIR "/") + base + ".bmp";
-  if (SD.exists(bp)) return;
-  if (!SD.exists(THUMBS_DIR)) SD.mkdir(THUMBS_DIR);
+  // The active photo lease excludes thumbnail replacement during rendering.
+  PhotoMeta meta;
+  if (!photoMeta(name, meta)) return;
+  if (storage.exists(photoThumbPath(meta, true))) return;
+  String bp = photoThumbPath(meta, false);
+  if (storage.exists(bp)) return;
+  if (!storage.exists(THUMBS_DIR)) storage.mkdir(THUMBS_DIR);
 
   // EPD colour code -> RGB (codes outside the palette render white)
   uint8_t lut[16][3];
@@ -542,7 +549,7 @@ void thumbEnsureFromBuffer(const String& base) {
   for (int i = 0; i < PALETTE_SIZE; i++)
     memcpy(lut[paletteEPD[i]], paletteRGB[i], 3);
 
-  File f = SD.open(bp.c_str(), FILE_WRITE);
+  StorageFile f = storage.open(bp + ".part", FILE_WRITE);
   if (!f) { Serial.printf("Thumb write failed: %s\n", bp.c_str()); return; }
 
   const uint32_t rowBytes = THUMB_W * 3;   // 600, already a multiple of 4
@@ -556,7 +563,7 @@ void thumbEnsureFromBuffer(const String& base) {
   bmpPutU16(hdr + 26, 1);                         // planes
   bmpPutU16(hdr + 28, 24);                        // bits per pixel
   bmpPutU32(hdr + 34, rowBytes * THUMB_H);        // image size
-  f.write(hdr, sizeof(hdr));
+  bool written = f.write(hdr, sizeof(hdr)) == sizeof(hdr);
 
   uint8_t row[THUMB_W * 3];
   for (int ty = THUMB_H - 1; ty >= 0; ty--) {     // BMP rows are bottom-up
@@ -570,8 +577,11 @@ void thumbEnsureFromBuffer(const String& base) {
         }
       *o++ = b >> 4; *o++ = g >> 4; *o++ = r >> 4;   // BGR, /16
     }
-    f.write(row, sizeof(row));
+    if (f.write(row, sizeof(row)) != sizeof(row)) { written = false; break; }
   }
   f.close();
-  Serial.printf("Thumbnail written: %s\n", bp.c_str());
+  if (!written || !storage.rename(bp + ".part", bp)) {
+    storage.remove(bp + ".part"); operationError("Thumbnail write failed");
+  }
+  storageChanged();
 }

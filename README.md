@@ -5,7 +5,7 @@ _YouTube Overview (covers the earlier nginx-based version)_
 
 Custom firmware for the [Waveshare ESP32-S3-PhotoPainter](https://www.waveshare.com/wiki/ESP32-S3-PhotoPainter), a battery-powered e-ink photo frame featuring an ESP32-S3 and a 7.3" Spectra ACeP 6-colour display (800×480). This project replaces the stock firmware with an Arduino-based sketch.
 
-The frame is **self-contained**: when plugged into USB-C power it runs a built-in **web server** where you browse a **gallery** of your original photos on the SD card and **upload** new ones (one or many at a time) from your phone or computer. The originals are kept on the card; the first time a photo is displayed it is resized and Floyd–Steinberg dithered to the 6-colour panel format **on the fly**, and the result is cached on the SD card so every later display is a fast load. On battery the frame deep-sleeps, rotating through your photos and reporting temperature, humidity, and battery voltage to Home Assistant via MQTT. **No external image server is required.**
+The frame is **self-contained**: when plugged into USB-C power it runs a built-in **web server** where you browse a **gallery** of photos on the SD card and **upload** new ones (one or many at a time) from your phone or computer. Browser uploads store an **800x480 frame-ready copy**, with optional crop and rotation editing; the untouched original stays on your phone or computer. The first time a photo is displayed it is Floyd–Steinberg dithered to the 6-colour panel format **on the fly**, and the result is cached on the SD card so every later display is a fast load. On battery the frame deep-sleeps, rotating through your photos and reporting temperature, humidity, and battery voltage to Home Assistant via MQTT. **No external image server is required.**
 
 > **Note:** This firmware is **not** based on the official Waveshare ESP-IDF demo. It is written from scratch using the Arduino framework. The stock firmware is not required, but an SD card **is** (it stores your photos).
 
@@ -18,12 +18,16 @@ The frame has two modes, chosen automatically at boot based on whether USB-C pow
 
 ### WiFi behaviour
 
-By default (no saved network) the frame **hosts its own WPA2 access point** named `PhotoFrame-Setup`. Connect to it and open the web page to set your home WiFi. Once saved, the frame connects to your network as a normal client and you reach the gallery at its IP on your LAN. If the saved network can't be found, it falls back to hosting its own hotspot again so you can always reconfigure it.
+By default (no saved network) the frame **hosts its own WPA2 access point** named `PhotoFrame-Setup`. Connect to it and open the web page to set your home WiFi. Once saved and restarted, the frame connects to your network as a normal client. Open `http://photoframe.local/` or its IP address on your LAN. The WiFi page lets you choose a unique hostname for each frame. If the saved network can't be found, it falls back to hosting its own hotspot again so you can always reconfigure it.
 
 ## Features
 
-- Built-in web server (USB-powered): photo **gallery** (shows originals), multi-file **upload**, **delete**, and "show now"
-- Originals kept on the SD card; each is dithered to the 800×480 6-colour panel format (bilinear cover-crop + Floyd–Steinberg) **lazily at display time**, then cached as a `.bin` so later displays skip the work
+- Built-in web server (USB-powered): photo **gallery** (shows stored photos), multi-file **upload**, **delete**, and "show now"
+- Optional crop, zoom, and rotation before batch upload; browser uploads store 800x480 JPEGs and matching thumbnails
+- Safe streamed uploads with per-file progress, explicit errors, retry tokens, and interruption cleanup
+- Versioned dither caches built **lazily at display time**, with independent identities for each complete filename
+- Responsive HTTP during decoding/panel refresh, queued display requests, and device status
+- Gallery pagination (24 photos per page) and `photoframe.local` discovery
 - Full **progressive JPEG** decoding via a JPEGDEC fork that buffers the multi-scan coefficients in PSRAM (with automatic 1/8-thumbnail fallback for very large progressive files)
 - Self-hosting WPA2 access point with web-based WiFi configuration; STA with AP fallback
 - Web-based MQTT configuration (separate settings page)
@@ -98,15 +102,20 @@ If you'd like a device to come up already knowing your WiFi/MQTT (so you can ski
 2. On a phone/laptop, join the WiFi network **`PhotoFrame-Setup`** (password `photoframe` unless you changed it).
 3. Open a browser to **`http://192.168.4.1/`** (most devices pop up the captive portal automatically).
 4. Go to the **WiFi** page, enter your home network, and **Save**. Unplug and replug the frame to join it.
-5. Reconnect your phone/laptop to your home WiFi and browse to the frame's new IP (check your router, or it logs the IP to the serial console). The gallery is now reachable on your LAN.
+5. Reconnect your phone/laptop to your home WiFi and open **`http://photoframe.local/`** (or your configured hostname). If your network/client does not support mDNS, use the frame's IP from the router or serial console.
 
 ### 5. Using the gallery
 
-- **Upload** — on the Gallery page, choose one or more `.jpg`/`.jpeg`/`.bmp` files (multi-select is supported) and upload. The originals are saved immediately; nothing is processed until a photo is first displayed.
-- **Gallery** — shows the original photos. Each shows a cache badge (*cached* / *not cached* / *failed*).
-- **Show** — display any photo on the panel immediately. Uncached photos take a few extra seconds to decode + dither first; the ~30s panel refresh follows either way.
-- **Clear dither cache** — deletes all cached `.bin` buffers; each is rebuilt automatically the next time its photo is displayed (use after tweaking the dither pipeline).
-- **Delete** — removes both the original and its cached buffer from the SD card.
+- **Choose photos** - select JPEG/BMP files. Each gets a centered preview; optionally use **Edit crop** to drag, zoom, rotate by 90 degrees, or reset it. The browser handles EXIF orientation.
+- **Upload** - files are converted and uploaded sequentially as **800x480 JPEGs**. Only this prepared copy is stored in `/originals`; keep your original photos on your phone/computer. Conversion failures are shown instead of silently sending unprepared files.
+- **Retry** - each file reports its own result. Retry after interruption safely within the same page: its token prevents duplicating a committed upload. A failed thumbnail retries the thumbnail only. Reloading the page starts a new batch, so check the gallery before uploading again.
+- **Gallery** - Previous/Next browse 24 photos at a time. Thumbnails load lazily, falling back to the stored source. Cards report cached, uncached, or processing-failed state.
+- **Show** - returns immediately. Status progresses through preparing and refreshing; a panel refresh takes roughly 30 seconds. One request can wait behind the active refresh; a newer Show replaces that pending request. The displayed-photo label changes only after successful refresh.
+- **Device status** - current/pending photo, next rotation, free SD space, WiFi signal/IP/hostname, MQTT status, and the most recent error. Observation ages distinguish sampled telemetry from current readings.
+- **Clear dither cache** - removes generated panel buffers and clears processing failures; images rebuild when displayed. Busy displays/uploads prevent conflicting maintenance.
+- **Delete** - removes a source photo and its generated files. Active or queued photos are protected from deletion.
+
+WiFi and MQTT password fields are blank when loaded. **Blank means keep the saved password**; use **Clear saved password** explicitly to remove it. WiFi/hostname changes require restarting the frame. MQTT settings apply after current control work finishes.
 
 ### 6. MQTT / Home Assistant
 
@@ -147,7 +156,10 @@ No manual MQTT entity configuration is needed — just ensure the HA MQTT integr
 | `spectra73.ino`         | Spectra 7.3" ACeP e-ink panel driver + framebuffer ⇄ SD `.bin` I/O |
 | `image_processing.ino`  | JPEG/BMP decode, bilinear resize, Floyd–Steinberg dither           |
 | `network.ino`           | WiFi station connect + WPA2 access-point fallback                  |
-| `webserver.ino`         | HTTP server: gallery, upload, serve originals, WiFi/MQTT settings pages |
+| `webserver.ino`         | Dedicated HTTP task, paginated gallery, uploads, status, settings |
+| `runtime.ino`           | Display scheduling, shared status, safe shutdown, control-task maintenance |
+| `photo_store.cpp` / `storage.h` | Revisioned metadata, upload receipts, migration, and serialized SD access |
+| `web/` / `web_assets.h` | Editable browser UI and generated flash-resident assets |
 | `config.ino` / `config.h` | Persistent configuration (Preferences/NVS)                       |
 | `config_defaults.h`     | Compile-time factory defaults (AP name/password, rotate interval)  |
 | `sdcard.ino`            | SD card initialisation                                             |
@@ -156,19 +168,74 @@ No manual MQTT entity configuration is needed — just ensure the HA MQTT integr
 
 ## Storage layout (SD card)
 
-- `/originals/<base>.<ext>` — the original uploaded photos (`.jpg`/`.jpeg`/`.bmp`). **This is what the gallery displays and what display rotation picks from.**
-- `/dithered/<base>.bin` — lazily built display cache: 800×480 4bpp panel buffers (192,000 bytes each), paired with each original by base name. Each is created the first time its photo is displayed and reused after.
+- `/originals/<filename>` - display sources. Browser uploads are prepared 800x480 JPEGs; existing JPEG/BMP files copied directly to the card remain supported without renaming.
+- `/photo-meta/<filename-hash>` - fixed-size, checksummed source/thumbnail revisions and source size/modification time. The full filename **including extension** identifies a photo; FAT names are treated case-insensitively.
+- `/dithered/<filename-hash>-<source-revision>-r2.bin` - 192,000-byte display buffers, keyed by source and rendering version.
+- `/thumbs/<filename-hash>-<thumbnail-revision>.jpg|.bmp` - browser JPEG thumbnails or device-generated BMP fallbacks.
+- `/upload-temp/` - incomplete uploads, excluded from the gallery and rotation. Removed after failure or on next boot.
+- `/upload-receipts/<token>` - persistent retry receipts. A receipt is valid only while its matching source/revision exists.
 
-A photo shows as *not cached* in the gallery until its `/dithered/<base>.bin` exists, then *cached*.
+On the first upgraded SD initialization, **legacy generated dither buffers and thumbnails are discarded** and rebuilt lazily. Source photos and their filenames are preserved. `.bak` metadata records support recovery if power is lost between renames. Back up the SD card before firmware upgrades.
 
-## Image pipeline (lazy render at display time)
+Files added/changed outside the web UI are registered when enumerated or selected, using their complete name, size, and modification time. If an external editor preserves both size and timestamp, remove the corresponding metadata and generated files while the card is offline to force a fresh import. A full card can still serve existing photos using reproducible import revisions, even if their sidecar cannot be saved.
 
-1. The browser uploads one or more JPEG/BMP files to `/upload`; each is streamed straight into `/originals` and the request returns immediately — nothing is processed at upload time.
-2. When a photo is displayed (rotation timer, button, or the web UI's **Show**), `ensureDitheredInBuffer()` in [esp32_photo-frame.ino](esp32_photo-frame/esp32_photo-frame.ino) checks for its cached `/dithered/<base>.bin`. On a **cache hit** it just loads the buffer (`epdLoadBufferFromFile`) and refreshes the panel — no decoding, which keeps battery refreshes fast and cheap. A corrupt/short `.bin` is deleted and re-rendered automatically.
-3. On a **cache miss**, `imgDecode()` in [image_processing.ino](esp32_photo-frame/image_processing.ino) decodes the original (JPEGDEC picks the most aggressive downscale that still covers 800×480; progressive JPEGs get a PSRAM-backed full multi-scan decode), then bilinear-resizes (cover + centred crop) into an RGB888 buffer in PSRAM.
-4. The Floyd–Steinberg stage converts the RGB data into the 6-colour ACeP palette directly in the panel framebuffer, which is saved to `/dithered/<base>.bin` (`epdSaveBufferToFile`) before the panel refreshes — so the work is done once per photo, not once per display.
+## Image pipeline and task ownership
 
-Deleting a photo removes both its original and its cached buffer. A file that fails to decode is marked *failed* and skipped (not retried in a loop); display rotation picks another photo instead.
+1. Browser conversion produces the selected 800x480 crop plus a matching 400x240 JPEG thumbnail.
+2. The HTTP task streams the payload into a temporary file, checks every write and image signature, persists its receipt/metadata, then renames the completed source. Maximum raw HTTP upload: **20 MiB/photo**, **256 KiB/thumbnail**, one file per request. Full decoding still happens at display time.
+3. The control task selects a photo and exclusively owns JPEGDEC, image buffers, panel SPI, sensors/PMU, and MQTT. Cache misses use the existing JPEG/BMP resize/dither pipeline; hits load the panel buffer.
+4. The control task refreshes the panel while the separate HTTP task continues serving requests. SD operations are serialized individually; locks are not held during panel waits, CPU rendering, or socket writes.
+5. GPIO4, rotation, startup display, Show, and the diagnostic pattern share the display scheduler. Automatic rotation cannot replace manual pending work. Conflicting deletion/cache-clear/thumbnail writes return a busy error.
+6. USB removal stops new work, closes/cleans uploads, finishes the active panel operation, stops HTTP/DNS/mDNS, and enters battery sleep. Battery wakeups do not start an HTTP task.
+
+The synchronous HTTP library still serves **one client at a time**. Another HTTP transfer can delay status polling; moving the panel work off HTTP removes the long refresh stall, not this library limit.
+
+## HTTP interface
+
+JSON responses use `Cache-Control: no-store`; failures return `{ "ok": false, "error": "..." }` with a non-2xx status. Image URLs include revision tokens and cache for a week. Unversioned image requests revalidate with ETags.
+
+| Route | Behavior |
+|---|---|
+| `GET /api/photos?limit=24&cursor=...` | `{photos, next_cursor, generation}`; limit 1-48. Photo entries include `name`, `revision`, `thumbnail_revision`, `cached`, and `failed`. A changed generation returns HTTP 409 with `restart:true`. |
+| `GET /api/status` | Display stage, active/pending jobs, current photo, next rotation, storage, WiFi, MQTT, observation times, and last error. Time fields are milliseconds since boot. |
+| `GET /api/config` | Non-secret settings and booleans indicating whether passwords are saved. |
+| `GET /original?file=...&v=...` / `GET /thumb?file=...&v=...` | Source/thumbnail; expired revisions return 404. Thumbnail absence permits source fallback. |
+| `POST /upload?token=<32 lowercase hex characters>` | Multipart `file`; HTTP 200 includes `ok`, stored `name`, and `revision`. Reuse the token only to retry the same payload. Legacy requests without a token still work but cannot deduplicate a lost response. |
+| `POST /thumb?name=...` | Multipart JPEG thumbnail; independent commit/result from the source upload. |
+| `POST /show?file=...` | HTTP **202** with `job_id`; observe completion in `/api/status`. Latest pending request wins. |
+| `POST /test` / `POST /redither` | HTTP 202 diagnostic/maintenance job; HTTP 409 when conflicting work is active. |
+| `POST /delete?file=...` | Deletes source and derived files; HTTP 409 for a protected photo. |
+| `POST /api/wifi` | Form fields `ssid`, `pass`, `hostname`, optional `clear_password=true`. |
+| `POST /api/mqtt` | Form fields `host`, `port`, `user`, `pass`, optional `clear_password=true`. Port must be 1-65535; omission defaults to 1883. |
+
+**Compatibility changes:** `/api/photos` now returns a paginated object instead of a bare array. Show/test/cache-clear are asynchronous. Clients must check HTTP status and poll job state rather than treating acceptance as display completion. Settings remain in NVS; older individual keys are read until a new settings group is saved successfully.
+
+## Development and verification
+
+The editable browser sources are in `web/`. Generate the checked-in PROGMEM header after editing them:
+
+```powershell
+python tools/embed_web.py
+python tools/embed_web.py --check
+npm.cmd ci
+npm.cmd test
+npm.cmd run test:browser
+```
+
+Arduino IDE builds use the committed header and require no Node/Python tooling. Browser tests use headless Microsoft Edge with desktop and mobile viewports. See [tests/README.md](tests/README.md) for firmware logic tests and the physical-device acceptance checklist.
+
+Reproducible firmware configuration used for validation:
+
+- ESP32 Arduino core **3.3.8**
+- PubSubClient **2.8**, XPowersLib **0.3.3**
+- JPEGDEC `Progressive-JPEG`, commit **d09cf27644cefdc5efb63d19e95de43559938cd4**
+- ESP32S3 Dev Module, **16 MB flash**, **OPI PSRAM**, **USB CDC on boot**, default partition scheme
+
+```powershell
+arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,CDCOnBoot=cdc" --build-path .build/firmware esp32_photo-frame
+```
+
+Compilation does not flash a connected device. Keep build output and local test dependencies out of source control.
 
 ## Power / mode behaviour
 

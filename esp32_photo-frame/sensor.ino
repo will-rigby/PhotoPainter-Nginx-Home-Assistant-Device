@@ -123,15 +123,20 @@ static bool shtc3Read(float& tempC, float& humidity) {
 // MQTT connect + HA auto-discovery
 // --------------------------------------------------
 
-static bool mqttConnect() {
-  mqtt.setServer(cfgMqttHost.c_str(), cfgMqttPort);
+static String activeMqttHost;
+
+static bool mqttConnect(const ConfigSnapshot& config) {
+  activeMqttHost = config.host;
+  mqtt.setServer(activeMqttHost.c_str(), config.port);
+  mqtt.setKeepAlive(120);
+  mqtt.setSocketTimeout(3);
   mqtt.setBufferSize(512);
 
   const char* clientId = "ESP32-PhotoFrame";
   bool ok;
 
-  if (cfgMqttUser.length() > 0) {
-    ok = mqtt.connect(clientId, cfgMqttUser.c_str(), cfgMqttPass.c_str());
+  if (config.user.length() > 0) {
+    ok = mqtt.connect(clientId, config.user.c_str(), config.mqttPass.c_str());
   } else {
     ok = mqtt.connect(clientId);
   }
@@ -183,6 +188,7 @@ static bool mqttConnect() {
 // --------------------------------------------------
 
 void sensorReport() {
+  ConfigSnapshot config = configSnapshot();
   float tempC = 0, humidity = 0;
   bool hasSensor = false;
 
@@ -204,7 +210,7 @@ void sensorReport() {
   }
 
   // No broker configured → nothing to publish.
-  if (cfgMqttHost.length() == 0) {
+  if (config.host.length() == 0) {
     Serial.println("MQTT not configured, skipping report");
     return;
   }
@@ -216,7 +222,7 @@ void sensorReport() {
       Serial.println("Hosting AP (no uplink), skipping MQTT report");
       return;
     }
-    if (!wifiConnectSTA(cfgWifiSsid, cfgWifiPass)) {
+    if (!wifiConnectSTA(config.ssid, config.wifiPass)) {
       Serial.println("WiFi failed, skipping MQTT report");
       return;
     }
@@ -224,7 +230,7 @@ void sensorReport() {
   }
 
   if (!mqtt.connected()) {
-    if (!mqttConnect()) {
+    if (!mqttConnect(config)) {
       if (weConnectedWifi) wifiDisconnect();
       return;
     }

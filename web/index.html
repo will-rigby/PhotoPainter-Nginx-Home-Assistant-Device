@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Photo Frame</title><link rel="stylesheet" href="/app.css"><script src="/app.js" defer></script></head>
+<body data-page="gallery"><nav aria-label="Main"><a href="/" aria-current="page">Gallery</a><a href="/wifi">WiFi</a><a href="/mqtt">MQTT</a></nav>
+<main><h1>Photo Frame</h1><section id="device" class="panel" aria-label="Device status"><p>Connecting to the frame…</p></section>
+<p id="notice" role="status" aria-live="polite"></p>
+<section class="panel"><h2>Add photos</h2><p>Choose JPEG or BMP photos. A prepared 800×480 copy is stored on the frame; your untouched original stays on your device.</p>
+<label for="files">Choose photos</label><input id="files" type="file" accept=".jpg,.jpeg,.bmp" multiple>
+<p>Centered crops are ready to upload. Use Edit crop on any preview to reposition, zoom, or rotate it.</p>
+<div id="uploads" class="grid"></div><button id="upload" disabled>Upload photos</button></section>
+<section><div class="toolbar"><h2>Gallery</h2><button id="refresh">Refresh</button><button id="clear-cache">Clear dither cache</button><button id="test-pattern">Test pattern</button></div>
+<div id="gallery" class="grid" aria-live="polite"></div><div class="pager"><button id="previous" disabled>Previous</button><span id="page-number">Page 1</span><button id="next" disabled>Next</button></div></section>
+</main>
+<dialog id="editor" aria-labelledby="editor-title"><h2 id="editor-title">Edit crop</h2><p>Drag the image to reposition it.</p><canvas id="crop-canvas" width="800" height="480" aria-label="Photo crop preview"></canvas>
+<label for="zoom">Zoom</label><input id="zoom" type="range" min="1" max="4" step="0.01" value="1">
+<div class="toolbar"><button id="rotate" type="button">Rotate 90°</button><button id="reset-crop" type="button">Reset</button><button id="cancel-crop" type="button">Cancel</button><button id="save-crop" type="button">Use this crop</button></div></dialog>
+</body></html>

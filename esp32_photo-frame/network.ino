@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: 0BSD
 
 #include "config.h"
+#include <ESPmDNS.h>
 
 // --------------------------------------------------
 // WiFi management (station + access-point fallback)
@@ -28,8 +29,9 @@ bool wifiConnectSTA(const String& ssid, const String& pass) {
   Serial.print("Connecting to WiFi: ");
   Serial.println(ssid);
 
+  ConfigSnapshot config = configSnapshot();
+  WiFi.setHostname(config.hostname.c_str());
   WiFi.mode(WIFI_STA);
-  WiFi.setHostname("ESP32-PhotoFrame");
   WiFi.begin(ssid.c_str(), pass.c_str());
 
   uint32_t start = millis();
@@ -100,4 +102,28 @@ void wifiBringUp() {
   }
   startAP();
   apMode = true;
+}
+
+// Owned by the HTTP task. Configuration changes take effect after restart.
+static bool discoveryRunning = false;
+static String discoveryHostname;
+static IPAddress discoveryIP;
+void networkDiscoveryStop() {
+  if (discoveryRunning) MDNS.end();
+  discoveryRunning = false;
+}
+void networkDiscoveryTick() {
+  static uint32_t lastCheck = 0;
+  if (millis() - lastCheck < 1000) return;
+  lastCheck = millis();
+  bool online = !apMode && WiFi.status() == WL_CONNECTED;
+  if (!online) { networkDiscoveryStop(); return; }
+  if (discoveryRunning && discoveryIP == WiFi.localIP()) return;
+  networkDiscoveryStop();
+  if (!discoveryHostname.length()) discoveryHostname = configSnapshot().hostname;
+  if (MDNS.begin(discoveryHostname.c_str())) {
+    MDNS.addService("http", "tcp", 80);
+    discoveryRunning = true;
+    discoveryIP = WiFi.localIP();
+  }
 }

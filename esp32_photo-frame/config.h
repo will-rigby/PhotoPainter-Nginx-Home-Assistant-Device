@@ -3,16 +3,15 @@
 
 #include <Arduino.h>
 #include "config_defaults.h"
+#include "app_support.h"
 
 // --------------------------------------------------
 // SD card folders
 // --------------------------------------------------
-//   /originals/<base>.<ext>  uploaded source images (gallery + display source)
-//   /dithered/<base>.bin     lazily built display cache (800x480 4bpp panel
-//                            buffers, rendered on first display, reused after)
-//   /thumbs/<base>.jpg|.bmp  gallery thumbnails (.jpg uploaded by the browser
-//                            alongside new photos, .bmp generated on-device at
-//                            display time for photos that lack one)
+//   /originals/<filename>  display source (browser-prepared or copied to SD)
+//   /dithered/<key>-<source-revision>-r2.bin  generated panel buffers
+//   /thumbs/<key>-<thumbnail-revision>.jpg|.bmp  generated gallery previews
+// Photo keys include the complete filename, including extension.
 #define ORIGINALS_DIR "/originals"
 #define DITHERED_DIR  "/dithered"
 #define THUMBS_DIR    "/thumbs"
@@ -21,7 +20,7 @@
 // Runtime configuration (persisted in NVS, namespace "cfg")
 // --------------------------------------------------
 //
-// These globals are loaded by configLoad() at boot and updated by the web UI.
+// Loaded at boot; use configSnapshot() after the HTTP task starts.
 // Declared here so every .ino sees them regardless of compile order.
 //
 
@@ -31,6 +30,7 @@ extern String   cfgMqttHost;
 extern uint16_t cfgMqttPort;
 extern String   cfgMqttUser;
 extern String   cfgMqttPass;
+extern String   cfgHostname;
 
 // Current WiFi / power state (set during boot).
 extern bool apMode;       // true when hosting our own access point
@@ -40,23 +40,20 @@ extern bool serverMode;   // true when on USB power and running the web server
 // render pipeline dithers directly into it.
 extern uint8_t* epdBuffer;
 
-// Lazy dither cache: make sure /dithered/<base>.bin exists for the given
+// Lazy dither cache: load or build the revisioned cache for the given
 // original (basename with extension) and leave the image in epdBuffer, ready
 // for epdDisplayCurrentBuffer(). Defined in esp32_photo-frame.ino.
 bool ensureDitheredInBuffer(const String& origName);
 
-// Failed-image set (image bases whose processing failed).
+// Failed-image set, keyed by complete filename.
 bool isFailedBase(const String& base);
 
-// Write /thumbs/<base>.bmp from the dithered framebuffer if the photo has no
+// Write a revisioned BMP from the dithered framebuffer if the photo has no
 // thumbnail yet (defined in image_processing.ino).
-void thumbEnsureFromBuffer(const String& base);
+void thumbEnsureFromBuffer(const String& name);
 
 // Draw a red low-battery icon into the framebuffer if the battery is low
 // (defined in esp32_photo-frame.ino; called by epdDisplayCurrentBuffer).
 void overlayLowBatteryIcon();
 
 void configLoad();
-void configSaveWifi(const String& ssid, const String& pass);
-void configSaveMqtt(const String& host, uint16_t port,
-                    const String& user, const String& pass);
